@@ -22,15 +22,19 @@ export const LenaAssistant: React.FC = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [transcript, setTranscript] = useState("");
   const [lenaResponse, setLenaResponse] = useState("");
-  const [isVisible, setIsVisible] = useState(true);
   const hasGreeted = useRef(false);
   const [error, setError] = useState<string | null>(null);
 
   const recognitionRef = useRef<any>(null);
   const synthesisRef = useRef<SpeechSynthesisVoice | null>(null);
   const isListeningRef = useRef(false);
-  const isWakingUp = useRef(false);
+  const isProcessingRef = useRef(false);
   const pipelineTimersRef = useRef<any[]>([]);
+
+  // Keep ref in sync with state
+  useEffect(() => {
+    isProcessingRef.current = isProcessing;
+  }, [isProcessing]);
 
   // --- Voice Setup ---
   useEffect(() => {
@@ -244,15 +248,35 @@ export const LenaAssistant: React.FC = () => {
 
         const lowerTranscript = (finalTranscript || interimTranscript).toLowerCase();
 
-        if (!isWakingUp.current && lowerTranscript.includes(WAKE_WORD)) {
-          isWakingUp.current = true;
-          setIsVisible(true);
-          speak("Hey there! I'm Lena. How can I help you today?");
-          setTimeout(() => {
-            isWakingUp.current = false;
-          }, 2000);
-        } else if (isVisible && finalTranscript && !isWakingUp.current) {
-          processCommand(finalTranscript);
+        // 1. Instant STOP command
+        if (lowerTranscript.includes("stop")) {
+          window.speechSynthesis.cancel();
+          setIsProcessing(false);
+          setLenaResponse("");
+          setTranscript("");
+          // Stop and restart recognition to clear its current buffer
+          try { recognition.stop(); } catch(e) {}
+          return;
+        }
+
+        if (isProcessingRef.current) return; // Prevent new commands while processing
+
+        // 2. Local SUMMARIZE trigger for quick response
+        if (lowerTranscript.includes("summarize")) {
+          setIsProcessing(true);
+          try { recognition.stop(); } catch(e) {}
+          setTranscript(finalTranscript || interimTranscript);
+          handleAction({ type: 'SUMMARIZE', response: "Summarizing the page for you." }).finally(() => setIsProcessing(false));
+          return;
+        }
+
+        // 3. Process final transcript for everything else
+        if (finalTranscript) {
+          const lowerFinal = finalTranscript.toLowerCase();
+          // Filter background noise in crowded places: only process if keywords strongly indicate a command
+          if (lowerFinal.match(/(lena|go to|click|open|navigate|what|who|how|start|initialize|proceed)/)) {
+            processCommand(finalTranscript);
+          }
         }
       };
 
@@ -313,7 +337,7 @@ export const LenaAssistant: React.FC = () => {
       window.removeEventListener('keydown', handleFirstInteraction);
       // We don't stop the recognition here to keep it alive across light renders
     };
-  }, [isVisible, navigate, speak, isListening]);
+  }, [navigate, speak, isListening]);
 
   // --- Pipeline Voice Narration ---
   useEffect(() => {
@@ -335,8 +359,6 @@ export const LenaAssistant: React.FC = () => {
       // Clear any existing timers
       pipelineTimersRef.current.forEach(clearTimeout);
       pipelineTimersRef.current = [];
-
-      setIsVisible(true);
 
       // Schedule the narration
       SCRIPT.forEach(({ delay, text }) => {
@@ -364,7 +386,6 @@ export const LenaAssistant: React.FC = () => {
 
   return (
     <AnimatePresence>
-      {isVisible && (
         <motion.div
           initial={{ opacity: 0, scale: 0.9, y: 20 }}
           animate={{ opacity: 1, scale: 1, y: 0 }}
@@ -378,12 +399,6 @@ export const LenaAssistant: React.FC = () => {
                 <div className="w-2 h-2 rounded-full bg-primary animate-pulse" />
                 <span className="font-semibold text-sm tracking-tight">LENA Assistant</span>
               </div>
-              <button
-                onClick={() => setIsVisible(false)}
-                className="hover:bg-primary/10 p-1 rounded-full transition-colors"
-              >
-                <X className="w-4 h-4" />
-              </button>
             </div>
 
             {/* Content */}
@@ -425,20 +440,6 @@ export const LenaAssistant: React.FC = () => {
             </div>
           </div>
         </motion.div>
-      )}
-
-      {/* Trigger Button (if hidden) */}
-      {!isVisible && (
-        <motion.button
-          initial={{ opacity: 0, scale: 0.8 }}
-          animate={{ opacity: 1, scale: 1 }}
-          onClick={() => setIsVisible(true)}
-          className="fixed bottom-6 right-6 z-[100] w-12 h-12 bg-primary text-primary-foreground rounded-full shadow-lg flex items-center justify-center hover:scale-110 transition-transform group"
-        >
-          <div className="absolute inset-0 bg-primary rounded-full animate-ping opacity-20 group-hover:opacity-40" />
-          <Command className="w-5 h-5 relative z-10" />
-        </motion.button>
-      )}
     </AnimatePresence>
   );
 };
