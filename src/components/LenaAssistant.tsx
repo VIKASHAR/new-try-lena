@@ -30,11 +30,6 @@ export const LenaAssistant: React.FC = () => {
   const isProcessingRef = useRef(false);
   const pipelineTimersRef = useRef<any[]>([]);
 
-  // Keep ref in sync with state
-  useEffect(() => {
-    isProcessingRef.current = isProcessing;
-  }, [isProcessing]);
-
   // --- Voice Setup ---
   useEffect(() => {
     const loadVoices = () => {
@@ -78,6 +73,7 @@ export const LenaAssistant: React.FC = () => {
 
   // --- Command Processing ---
   const processCommand = async (text: string) => {
+    isProcessingRef.current = true;
     setIsProcessing(true);
     setTranscript(text);
 
@@ -161,6 +157,7 @@ export const LenaAssistant: React.FC = () => {
       console.error("Groq Error:", err);
       speak("I encountered an error while processing your request.");
     } finally {
+      isProcessingRef.current = false;
       setIsProcessing(false);
     }
   };
@@ -262,10 +259,14 @@ export const LenaAssistant: React.FC = () => {
 
         // 2. Local SUMMARIZE trigger for quick response
         if (lowerTranscript.includes("summarize")) {
+          isProcessingRef.current = true;
           setIsProcessing(true);
           try { recognition.stop(); } catch(e) {}
           setTranscript(finalTranscript || interimTranscript);
-          handleAction({ type: 'SUMMARIZE', response: "Summarizing the page for you." }).finally(() => setIsProcessing(false));
+          handleAction({ type: 'SUMMARIZE', response: "Summarizing the page for you." }).finally(() => {
+             isProcessingRef.current = false;
+             setIsProcessing(false);
+          });
           return;
         }
 
@@ -273,7 +274,8 @@ export const LenaAssistant: React.FC = () => {
         if (finalTranscript) {
           const lowerFinal = finalTranscript.toLowerCase();
           // Filter background noise in crowded places: only process if keywords strongly indicate a command
-          if (lowerFinal.match(/(lena|go to|click|open|navigate|what|who|how|start|initialize|proceed)/)) {
+          if (lowerFinal.match(/(lena|go to|click|open|navigate|what|who|why|how|start|initialize|proceed|thank|yes)/)) {
+            try { recognition.stop(); } catch(e) {} // Force restart buffer
             processCommand(finalTranscript);
           }
         }
@@ -289,6 +291,9 @@ export const LenaAssistant: React.FC = () => {
           isListeningRef.current = false;
           setIsListening(false);
         }
+        
+        // Ensure recognition fully stops on error so onend restarts it
+        try { recognition.stop(); } catch(e) {}
       };
 
       recognition.onend = () => {
