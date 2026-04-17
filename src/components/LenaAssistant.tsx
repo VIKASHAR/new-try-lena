@@ -26,8 +26,10 @@ export const LenaAssistant: React.FC = () => {
 
   const recognitionRef = useRef<any>(null);
   const synthesisRef = useRef<SpeechSynthesisVoice | null>(null);
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const isListeningRef = useRef(false);
   const isProcessingRef = useRef(false);
+  const isSpeakingRef = useRef(false);
   const pipelineTimersRef = useRef<any[]>([]);
 
   // --- Voice Setup ---
@@ -62,11 +64,19 @@ export const LenaAssistant: React.FC = () => {
     if (!window.speechSynthesis) return;
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
+    utteranceRef.current = utterance; // Prevent Chrome GC bug
+
     if (synthesisRef.current) {
       utterance.voice = synthesisRef.current;
     }
     utterance.pitch = 1.0;
     utterance.rate = 1.0;
+    
+    // Prevent echo: ignore mic input (except "stop") while speaking
+    utterance.onstart = () => { isSpeakingRef.current = true; };
+    utterance.onend = () => { isSpeakingRef.current = false; };
+    utterance.onerror = () => { isSpeakingRef.current = false; };
+
     window.speechSynthesis.speak(utterance);
     setLenaResponse(text);
   }, []);
@@ -247,13 +257,18 @@ export const LenaAssistant: React.FC = () => {
         // 1. Instant STOP command
         if (lowerTranscript.includes("stop")) {
           window.speechSynthesis.cancel();
+          isProcessingRef.current = false;
+          isSpeakingRef.current = false;
           setIsProcessing(false);
-          setLenaResponse("");
+          setLenaResponse("Stopped.");
           setTranscript("");
           // Stop and restart recognition to clear its current buffer
           try { recognition.stop(); } catch(e) {}
           return;
         }
+
+        // If Lena is speaking, ignore everything else so she doesn't hear herself (Echo cancellation)
+        if (isSpeakingRef.current) return;
 
         if (isProcessingRef.current) return; // Prevent new commands while processing
 
