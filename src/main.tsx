@@ -1,0 +1,16 @@
+import { StrictMode } from "react"
+import { createRoot } from "react-dom/client"
+
+import "./index.css"
+import { ThemeProvider } from "next-themes";
+import { Routes } from "./Routes"
+import { createBrowserRouter, RouterProvider } from "react-router-dom"
+const router = createBrowserRouter(Routes);
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false}>
+      <RouterProvider router={router}/>
+    </ThemeProvider>
+  </StrictMode>
+)

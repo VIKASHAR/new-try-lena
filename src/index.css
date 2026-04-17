@@ -1,0 +1,151 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/manrope";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+    --radius: 0.25rem;
+    --background: #ffffff;
+    --foreground: #002f5a;
+    --card: #ffffff;
+    --card-foreground: #002f5a;
+    --popover: #ffffff;
+    --popover-foreground: #002f5a;
+    --primary: #002f5a;                /* Linde Blue */
+    --primary-foreground: #ffffff;
+    --secondary: #eef5fc;
+    --secondary-foreground: #002f5a;
+    --muted: #f4f8ff;
+    --muted-foreground: #5c6f8a;
+    --accent: #007AB9;
+    --accent-foreground: #ffffff;
+    --destructive: #dc2626;
+    --border: rgba(0, 47, 90, 0.08);
+    --input: rgba(0, 47, 90, 0.08);
+    --ring: #007AB9;
+    --chart-1: #007AB9; /* brand */
+    --chart-2: #005f94; /* deep accent */
+    --chart-3: #f59e0b; /* warning */
+    --chart-4: #ef4444; /* critical */
+    --chart-5: #75b8e4; /* bright blue */
+    --sidebar: #ffffff;
+    --sidebar-foreground: #002f5a;
+    --sidebar-primary: #007AB9;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: #eef5fc;
+    --sidebar-accent-foreground: #002f5a;
+    --sidebar-border: rgba(0, 47, 90, 0.08);
+    --sidebar-ring: #007AB9;
+}
+
+.dark {
+    --background: #0a0c10;
+    --foreground: #e8eaf0;
+    --card: #1e2130;
+    --card-foreground: #e8eaf0;
+    --popover: #151820;
+    --popover-foreground: #e8eaf0;
+    --primary: #005BAC;
+    --primary-foreground: #e8eaf0;
+    --secondary: #252840;
+    --secondary-foreground: #e8eaf0;
+    --muted: #1c1f2a;
+    --muted-foreground: #9da3b4;
+    --accent: #4f8ef7;
+    --accent-foreground: #e8eaf0;
+    --destructive: #f87171;
+    --border: rgba(255,255,255,0.08);
+    --input: rgba(255,255,255,0.12);
+    --ring: #4f8ef7;
+    --chart-1: #4f8ef7;
+    --chart-2: #6ee7b7;
+    --chart-3: #f59e0b;
+    --chart-4: #f87171;
+    --chart-5: #a78bfa;
+    --sidebar: #0f1117;
+    --sidebar-foreground: #e8eaf0;
+    --sidebar-primary: #005BAC;
+    --sidebar-primary-foreground: #e8eaf0;
+    --sidebar-accent: #1c1f2a;
+    --sidebar-accent-foreground: #e8eaf0;
+    --sidebar-border: rgba(255,255,255,0.08);
+    --sidebar-ring: #4f8ef7;
+}
+
+@theme inline {
+    --font-sans: 'Geist Variable', sans-serif;
+    --font-heading: 'Manrope Variable', sans-serif;
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+}
+/* ── LENA Landing Page Animations ──────────────────────────────────────────
+   Add these keyframes to your existing index.css
+   ─────────────────────────────────────────────────────────────────────────── */
+
+@keyframes scanAnim {
+  0%   { top: -1px; opacity: 0; }
+  5%   { opacity: 1; }
+  95%  { opacity: 1; }
+  100% { top: 100vh; opacity: 0; }
+}
+
+@keyframes glowPulse {
+  0%, 100% { opacity: 0.7; transform: translate(-50%, -58%) scale(1); }
+  50%       { opacity: 1;   transform: translate(-50%, -58%) scale(1.07); }
+}
+
+@keyframes dotPulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
