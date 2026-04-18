@@ -3,462 +3,623 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { MicOff, Loader2, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// --- Constants & Types ---
-const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.3-70b-versatile";
+// ─────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
 
-interface Action {
-  type: 'NAVIGATE' | 'CLICK' | 'SUMMARIZE' | 'CHAT' | 'GREET';
-  payload?: string;
-  response?: string;
-}
+// ─────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────
+type LenaStatus = 'idle' | 'listening' | 'wake-detected' | 'processing' | 'speaking';
 
-// --- Component ---
+// ─────────────────────────────────────────────
+// LenaAssistant Component
+// ─────────────────────────────────────────────
 export const LenaAssistant: React.FC = () => {
-  const navigate = useNavigate();
-  const location = useLocation();
-  const [isListening, setIsListening] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [transcript, setTranscript] = useState("");
-  const [lenaResponse, setLenaResponse] = useState("");
-  const hasGreeted = useRef(false);
-  const [error, setError] = useState<string | null>(null);
+  const navigate    = useNavigate();
+  const location    = useLocation();
 
-  const recognitionRef = useRef<any>(null);
-  const synthesisRef = useRef<SpeechSynthesisVoice | null>(null);
-  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
-  const isListeningRef = useRef(false);
-  const isProcessingRef = useRef(false);
-  const isSpeakingRef = useRef(false);
-  const pipelineTimersRef = useRef<any[]>([]);
+  // ── UI state ──
+  const [status,       setStatus]       = useState<LenaStatus>('idle');
+  const [transcript,   setTranscript]   = useState('');
+  const [lenaResponse, setLenaResponse] = useState('Click anywhere to activate Lena...');
+  const [error,        setError]        = useState<string | null>(null);
 
-  // --- Voice Setup ---
+  // ── Refs shared across closures ──
+  const recognitionRef       = useRef<any>(null);
+  const voiceRef             = useRef<SpeechSynthesisVoice | null>(null);
+  const utteranceRef         = useRef<SpeechSynthesisUtterance | null>(null);
+  const statusRef            = useRef<LenaStatus>('idle');
+  const isActivatedRef       = useRef(false);
+  const awaitingCommandRef   = useRef(false);
+  const awaitingTimerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pipelineTimersRef    = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const resumeIntervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Latest navigate / pathname accessible from stable closures
+  const navigateRef          = useRef(navigate);
+  const pathnameRef          = useRef(location.pathname);
+  useEffect(() => { navigateRef.current  = navigate;          }, [navigate]);
+  useEffect(() => { pathnameRef.current  = location.pathname; }, [location.pathname]);
+
+  // ── Helper: keep status state & ref in sync ──
+  const setStatusBoth = useCallback((s: LenaStatus) => {
+    statusRef.current = s;
+    setStatus(s);
+  }, []);
+
+  // ════════════════════════════════════════════
+  // VOICE LOADING  (female-first priority list)
+  // ════════════════════════════════════════════
   useEffect(() => {
-    const loadVoices = () => {
+    const loadVoice = () => {
       const voices = window.speechSynthesis.getVoices();
-      // Try to find a nice female voice - Expanded list for better cross-browser compatibility
-      const femaleVoice = voices.find(v => {
-        const name = v.name;
-        return (
-          name.includes('Female') ||
-          name.includes('Google US English') ||
-          name.includes('Samantha') ||
-          name.includes('Victoria') ||
-          name.includes('Aria') ||
-          name.includes('Zira') ||
-          name.includes('Siri') ||
-          name.includes('Karen') ||
-          name.includes('Catherine') ||
-          name.includes('Hazel')
-        ) && v.lang.startsWith('en');
-      }) || voices.find(v => v.lang.startsWith('en'));
+      if (!voices.length) return;
 
-      synthesisRef.current = femaleVoice || null;
+      // Priority order – best female voices for Chrome / Edge on Windows & Mac
+      const PRIORITY = [
+        'Google UK English Female',
+        'Microsoft Aria Online (Natural) - English (United States)',
+        'Microsoft Aria - English (United States)',
+        'Microsoft Zira - English (United States)',
+        'Samantha',   // macOS Safari / Chrome
+        'Victoria',   // macOS
+        'Karen',      // macOS Australian
+        'Moira',      // macOS Irish
+        'Fiona',      // macOS Scottish
+        'Google US English',
+      ];
+
+      let selected: SpeechSynthesisVoice | undefined;
+      for (const name of PRIORITY) {
+        selected = voices.find(v => v.name.toLowerCase().includes(name.toLowerCase()));
+        if (selected) break;
+      }
+      // Fallback 1: any English voice with "female" / "woman" in its name
+      if (!selected) selected = voices.find(v => v.lang.startsWith('en') && /female|woman/i.test(v.name));
+      // Fallback 2: any en-US / en-GB voice
+      if (!selected) selected = voices.find(v => v.lang === 'en-US' || v.lang === 'en-GB');
+      // Fallback 3: any English voice
+      if (!selected) selected = voices.find(v => v.lang.startsWith('en'));
+
+      voiceRef.current = selected ?? null;
+      console.log('[Lena] Voice selected:', voiceRef.current?.name ?? 'browser default');
     };
 
-    window.speechSynthesis.onvoiceschanged = loadVoices;
-    loadVoices();
+    window.speechSynthesis.onvoiceschanged = loadVoice;
+    loadVoice();
+    return () => { window.speechSynthesis.onvoiceschanged = null; };
   }, []);
 
+  // ════════════════════════════════════════════
+  // SPEAK
+  // – Does NOT stop recognition (keeps "stop" always listenable)
+  // – Chrome 15-second TTS bug workaround via setInterval
+  // ════════════════════════════════════════════
   const speak = useCallback((text: string) => {
-    if (!window.speechSynthesis) return;
+    if (!window.speechSynthesis || !text.trim()) return;
+
+    // Cancel any in-flight speech
     window.speechSynthesis.cancel();
+    if (resumeIntervalRef.current) clearInterval(resumeIntervalRef.current);
+
     const utterance = new SpeechSynthesisUtterance(text);
-    utteranceRef.current = utterance; // Prevent Chrome GC bug
+    utteranceRef.current = utterance; // prevent GC in Chrome
 
-    if (synthesisRef.current) {
-      utterance.voice = synthesisRef.current;
-    }
-    utterance.pitch = 1.0;
-    utterance.rate = 1.0;
-    
-    // Prevent echo: ignore mic input (except "stop") while speaking
-    utterance.onstart = () => { isSpeakingRef.current = true; };
-    utterance.onend = () => { isSpeakingRef.current = false; };
-    utterance.onerror = () => { isSpeakingRef.current = false; };
+    if (voiceRef.current) utterance.voice = voiceRef.current;
+    utterance.pitch  = 1.15;  // slightly higher = more feminine
+    utterance.rate   = 1.0;
+    utterance.volume = 1.0;
 
-    window.speechSynthesis.speak(utterance);
+    setStatusBoth('speaking');
     setLenaResponse(text);
-  }, []);
 
-  // --- Command Processing ---
-  const processCommand = async (text: string) => {
-    isProcessingRef.current = true;
-    setIsProcessing(true);
-    setTranscript(text);
+    // Chrome silently stops TTS after ~15 s – keep it alive
+    resumeIntervalRef.current = setInterval(() => {
+      if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+    }, 8_000);
 
-    const apiKey = import.meta.env.VITE_GROQ_API_KEY;
-    if (!apiKey) {
-      setError("Groq API key missing in .env");
-      speak("I'm sorry, my AI processing is currently disabled because the API key is missing.");
-      setIsProcessing(false);
-      return;
-    }
-
-    try {
-      const pageElements = Array.from(document.querySelectorAll('button, a, [role="button"]'))
-        .map(el => el.textContent?.trim())
-        .filter(text => text && text.length < 50)
-        .join(", ");
-
-      const systemPrompt = `
-        You are "Lena", a voice assistant for the LENA Platform.
-        Current URL: ${window.location.href}
-        Current Path: ${location.pathname}
-        
-        Visible interactive elements (Buttons/Links): ${pageElements || "None detected"}
-        
-        Available routes:
-        - /supply-chain
-        - /manufacturing
-        - /commercial
-        - /finance
-        - /hr
-        - /it
-        - /assistant
-        - /settings
-        - /vision-panel
-        - /nurostack
-        - /nuromodels
-        - /nuroforge
-        
-        Your task is to parse the user's voice command and return a JSON object.
-        
-        CRITICAL RULES:
-        1. ALWAYS provide a "response" field with a friendly vocal confirmation. Lena MUST speak for every command.
-        2. If the user says "initialize", "start", "proceed", or "begin", and there is a relevant button (e.g., "Initialize Platform"), set type to "CLICK" and payload to the exact button name.
-        3. Do NOT jump to navigation if a corresponding button exists on the current page.
-        
-        Commands:
-        - Navigation: "Go to finance", "Open settings"
-        - Interaction: "Click the login button", "press start" (type: CLICK)
-        - Summarization: "Summarize this page", "what is this about?" (type: SUMMARIZE)
-        - General chat/help: "Who are you?", "Help me" (type: CHAT)
-
-        Return JSON ONLY:
-        {
-          "type": "NAVIGATE" | "CLICK" | "SUMMARIZE" | "CHAT" | "CLARIFY",
-          "payload": "the path or exact button label or null",
-          "response": "What you will say back to the user (MANDATORY)"
-        }
-      `;
-
-      const response = await fetch(GROQ_API_URL, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: GROQ_MODEL,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: text }
-          ],
-          response_format: { type: "json_object" }
-        })
-      });
-
-      const data = await response.json();
-      const action: Action = JSON.parse(data.choices[0].message.content);
-
-      handleAction(action);
-    } catch (err) {
-      console.error("Groq Error:", err);
-      speak("I encountered an error while processing your request.");
-    } finally {
-      isProcessingRef.current = false;
-      setIsProcessing(false);
-    }
-  };
-
-  const handleAction = async (action: Action) => {
-    if (action.response) speak(action.response);
-
-    switch (action.type) {
-      case 'NAVIGATE':
-        if (action.payload) navigate(action.payload);
-        break;
-      case 'CLICK':
-        if (action.payload) {
-          const buttons = Array.from(document.querySelectorAll('button, a'));
-          const target = buttons.find(b =>
-            b.textContent?.toLowerCase().includes(action.payload!.toLowerCase())
-          ) as HTMLElement;
-          if (target) {
-            target.click();
-          } else {
-            speak(`I couldn't find a button labeled ${action.payload}`);
-          }
-        }
-        break;
-      case 'SUMMARIZE':
-        const pageContent = document.querySelector('main')?.innerText || document.body.innerText;
-        const summary = await getSummaryFromGroq(pageContent.substring(0, 5000));
-        speak(summary);
-        break;
-      default:
-        break;
-    }
-  };
-
-  const getSummaryFromGroq = async (content: string) => {
-    const apiKey = import.meta.env.VITE_GROQ_API_KEY;
-    try {
-      const response = await fetch(GROQ_API_URL, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: GROQ_MODEL,
-          messages: [
-            { role: "system", content: "You are Lena. Summarize the following page content concisely in 2-3 sentences for voice delivery." },
-            { role: "user", content: content }
-          ]
-        })
-      });
-      const data = await response.json();
-      return data.choices[0].message.content;
-    } catch (err) {
-      return "I was unable to summarize the page content at this time.";
-    }
-  };
-
-  // --- Speech Recognition ---
-  useEffect(() => {
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      console.warn("Speech Recognition not supported in this browser");
-      return;
-    }
-
-    if (!recognitionRef.current) {
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-
-      recognition.onresult = (event: any) => {
-        let interimTranscript = '';
-        let finalTranscript = '';
-
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            finalTranscript += event.results[i][0].transcript;
-          } else {
-            interimTranscript += event.results[i][0].transcript;
-          }
-        }
-
-        const lowerTranscript = (finalTranscript || interimTranscript).toLowerCase();
-
-        // 1. Instant STOP command
-        if (lowerTranscript.includes("stop")) {
-          window.speechSynthesis.cancel();
-          isProcessingRef.current = false;
-          isSpeakingRef.current = false;
-          setIsProcessing(false);
-          setLenaResponse("Stopped.");
-          setTranscript("");
-          // Stop and restart recognition to clear its current buffer
-          try { recognition.stop(); } catch(e) {}
-          return;
-        }
-
-        // If Lena is speaking, ignore everything else so she doesn't hear herself (Echo cancellation)
-        if (isSpeakingRef.current) return;
-
-        if (isProcessingRef.current) return; // Prevent new commands while processing
-
-        // 2. Local SUMMARIZE trigger for quick response
-        if (lowerTranscript.includes("summarize")) {
-          isProcessingRef.current = true;
-          setIsProcessing(true);
-          try { recognition.stop(); } catch(e) {}
-          setTranscript(finalTranscript || interimTranscript);
-          handleAction({ type: 'SUMMARIZE', response: "Summarizing the page for you." }).finally(() => {
-             isProcessingRef.current = false;
-             setIsProcessing(false);
-          });
-          return;
-        }
-
-        // 3. Process final transcript for everything else
-        if (finalTranscript) {
-          const lowerFinal = finalTranscript.toLowerCase();
-          // Filter background noise in crowded places: only process if keywords strongly indicate a command
-          if (lowerFinal.match(/(lena|go to|click|open|navigate|what|who|why|how|start|initialize|proceed|thank|yes)/)) {
-            try { recognition.stop(); } catch(e) {} // Force restart buffer
-            processCommand(finalTranscript);
-          }
-        }
-      };
-
-      recognition.onerror = (event: any) => {
-        // Silently handle 'aborted' as it's often a harmless browser behavior
-        if (event.error === 'aborted') return;
-
-        console.error("Recognition Error:", event.error);
-        if (event.error === 'not-allowed') {
-          setError("Microphone access denied.");
-          isListeningRef.current = false;
-          setIsListening(false);
-        }
-        
-        // Ensure recognition fully stops on error so onend restarts it
-        try { recognition.stop(); } catch(e) {}
-      };
-
-      recognition.onend = () => {
-        // Indestructible Restart: Always try to stay alive if active
-        if (isListeningRef.current) {
-          setTimeout(() => {
-            try {
-              recognition.start();
-            } catch (e) {
-              // Ignore if already started
-            }
-          }, 100);
-        }
-      };
-
-      recognitionRef.current = recognition;
-    }
-
-    const startAssistant = () => {
-      const rec = recognitionRef.current;
-      if (!rec || isListeningRef.current) return;
-
-      try {
-        rec.start();
-        setIsListening(true);
-        isListeningRef.current = true;
-        hasGreeted.current = true;
-      } catch (err) {
-        // Silently catch start errors
+    const onDone = () => {
+      if (resumeIntervalRef.current) clearInterval(resumeIntervalRef.current);
+      // Return to listening only if we're still the current speech
+      if (isActivatedRef.current && statusRef.current === 'speaking') {
+        setStatusBoth('listening');
       }
     };
 
-    // First interaction handler
-    const handleFirstInteraction = () => {
-      startAssistant();
-      window.removeEventListener('click', handleFirstInteraction);
-      window.removeEventListener('keydown', handleFirstInteraction);
+    utterance.onend   = onDone;
+    utterance.onerror = (e) => {
+      if (e.error !== 'interrupted') console.warn('[Lena] TTS error:', e.error);
+      onDone();
     };
 
-    window.addEventListener('click', handleFirstInteraction);
-    window.addEventListener('keydown', handleFirstInteraction);
+    window.speechSynthesis.speak(utterance);
+  }, [setStatusBoth]);
+
+  // ════════════════════════════════════════════
+  // STOP EVERYTHING
+  // – Cancels TTS, pipeline timers, awaiting state
+  // – Stays in listening mode (does NOT speak, avoids "stop" echo loop)
+  // ════════════════════════════════════════════
+  const stopEverything = useCallback(() => {
+    window.speechSynthesis.cancel();
+    if (resumeIntervalRef.current) clearInterval(resumeIntervalRef.current);
+    if (awaitingTimerRef.current)  clearTimeout(awaitingTimerRef.current);
+    awaitingCommandRef.current = false;
+    pipelineTimersRef.current.forEach(clearTimeout);
+    pipelineTimersRef.current = [];
+
+    if (isActivatedRef.current) {
+      setStatusBoth('listening');
+      setTranscript('');
+      setLenaResponse('Stopped. Ready for your next command.');
+    }
+  }, [setStatusBoth]);
+
+  // ════════════════════════════════════════════
+  // PROCESS COMMAND  (Groq API)
+  // ════════════════════════════════════════════
+  const processCommand = useCallback(async (text: string) => {
+    if (!text.trim() || statusRef.current === 'processing') return;
+
+    setStatusBoth('processing');
+    setTranscript(text);
+    awaitingCommandRef.current = false;
+    if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
+
+    const apiKey = import.meta.env.VITE_GROQ_API_KEY;
+    if (!apiKey) {
+      speak("I'm sorry, my AI processing is disabled — the API key is missing.");
+      return;
+    }
+
+    try {
+      const pageElements = Array.from(
+        document.querySelectorAll('button, a, [role="button"]')
+      )
+        .map(el => el.textContent?.trim())
+        .filter((t): t is string => !!t && t.length < 60)
+        .slice(0, 25)
+        .join(', ');
+
+      const systemPrompt = `You are "Lena", a professional female voice assistant for the LENA Platform at Linde PLC.
+Current page path: ${pathnameRef.current}
+Interactive elements visible: ${pageElements || 'None detected'}
+
+Available navigation routes:
+/supply-chain, /manufacturing, /commercial, /finance, /hr, /it,
+/assistant, /settings, /vision-panel, /nurostack, /nuromodels, /nuroforge
+
+Parse the user's voice command and return a JSON object.
+
+CRITICAL RULES:
+1. "response" is ALWAYS mandatory — it is what Lena speaks aloud. Keep it 1–2 warm, professional sentences.
+2. For navigation: type="NAVIGATE", payload=the exact route path.
+3. For clicking a button: type="CLICK", payload=exact button label.
+4. For page summary: type="SUMMARIZE".
+5. For greetings / general questions: type="CHAT".
+6. Every action MUST have a spoken verbal confirmation in "response".
+7. Never leave "response" empty or null.
+
+Return strict JSON only — no markdown, no prose:
+{
+  "type": "NAVIGATE" | "CLICK" | "SUMMARIZE" | "CHAT",
+  "payload": "route path or button label or null",
+  "response": "What Lena will say (MANDATORY)"
+}`;
+
+      const res = await fetch(GROQ_API_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model:           GROQ_MODEL,
+          temperature:     0.3,
+          messages:        [
+            { role: 'system', content: systemPrompt },
+            { role: 'user',   content: text },
+          ],
+          response_format: { type: 'json_object' },
+        }),
+      });
+
+      if (!res.ok) throw new Error(`Groq API ${res.status}`);
+
+      const data   = await res.json();
+      const action = JSON.parse(data.choices[0].message.content);
+
+      // ① Speak the confirmation first (always)
+      speak(action.response || 'Done.');
+
+      // ② Execute the action after a short pause
+      setTimeout(() => {
+        switch (action.type) {
+          case 'NAVIGATE':
+            if (action.payload) navigateRef.current(action.payload);
+            break;
+
+          case 'CLICK': {
+            if (!action.payload) break;
+            const els    = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+            const target = els.find(el =>
+              el.textContent?.toLowerCase().includes(action.payload.toLowerCase())
+            ) as HTMLElement | undefined;
+            if (target) {
+              target.click();
+            } else {
+              // Delay error speech so it doesn't overlap current speech
+              setTimeout(() => speak(`I couldn't find a button labelled "${action.payload}". Please try again.`), 600);
+            }
+            break;
+          }
+
+          case 'SUMMARIZE': {
+            const content = (document.querySelector('main') as HTMLElement | null)?.innerText
+              ?? document.body.innerText;
+            getSummaryFromGroq(content.slice(0, 5_000)).then(speak);
+            break;
+          }
+
+          // CHAT — response already spoken
+          default:
+            break;
+        }
+      }, 250);
+
+    } catch (err) {
+      console.error('[Lena] Command error:', err);
+      speak('I encountered an error while processing your request. Please try again.');
+    }
+  }, [speak, setStatusBoth]);
+
+  // ─── Groq summarisation ───────────────────
+  const getSummaryFromGroq = async (content: string): Promise<string> => {
+    const apiKey = import.meta.env.VITE_GROQ_API_KEY;
+    try {
+      const res = await fetch(GROQ_API_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model:    GROQ_MODEL,
+          messages: [
+            {
+              role:    'system',
+              content: 'You are Lena, a professional female assistant. Summarise this page content in 2–3 clear sentences suitable for voice delivery. Be concise and informative.',
+            },
+            { role: 'user', content: content },
+          ],
+        }),
+      });
+      const data = await res.json();
+      return data.choices[0].message.content as string;
+    } catch {
+      return 'I was unable to summarise the page content at this time.';
+    }
+  };
+
+  // ─── Keep callback refs fresh for the stable recognition closure ───
+  const processCommandRef  = useRef(processCommand);
+  const stopEverythingRef  = useRef(stopEverything);
+  const speakRef           = useRef(speak);
+  useEffect(() => { processCommandRef.current = processCommand; }, [processCommand]);
+  useEffect(() => { stopEverythingRef.current = stopEverything; }, [stopEverything]);
+  useEffect(() => { speakRef.current          = speak;          }, [speak]);
+
+  // ════════════════════════════════════════════
+  // SPEECH RECOGNITION  (runs exactly ONCE)
+  //
+  // Key design decisions:
+  //  • continuous=true — never manually stopped from onresult
+  //    (stopping causes a ~200 ms gap that swallows the real command
+  //     after "Hey Lena" — this was the original bug)
+  //  • "stop" is checked BEFORE any status gate so it always fires
+  //  • isSpeaking is gated via statusRef (recognition keeps running
+  //    for echo-cancel; Chrome's built-in AEC handles the mic)
+  //  • Wake word: set awaitingCommand flag, do NOT stop recognition,
+  //    so the following command utterance is captured immediately
+  // ════════════════════════════════════════════
+  useEffect(() => {
+    const SR =
+      (window as any).SpeechRecognition ??
+      (window as any).webkitSpeechRecognition;
+
+    if (!SR) {
+      setError('Speech recognition not supported — please use Chrome or Edge.');
+      return;
+    }
+
+    const recognition = new SR() as any;
+    recognition.continuous      = true;   // never auto-stop
+    recognition.interimResults  = true;   // get partial results
+    recognition.lang            = 'en-US';
+    recognition.maxAlternatives = 1;
+    recognitionRef.current      = recognition;
+
+    // ── onresult ─────────────────────────────
+    recognition.onresult = (event: any) => {
+      let finalT  = '';
+      let interimT = '';
+
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        const t = event.results[i][0].transcript as string;
+        if (event.results[i].isFinal) finalT   += t;
+        else                          interimT  += t;
+      }
+
+      const combined = (finalT || interimT).toLowerCase().trim();
+
+      // ① STOP — always active, even while Lena is speaking
+      if (combined.includes('stop')) {
+        stopEverythingRef.current();
+        return;
+      }
+
+      // ② Gate: ignore everything else while speaking or processing
+      if (statusRef.current === 'speaking' || statusRef.current === 'processing') return;
+
+      // ③ Only act on final (confirmed) transcripts from here
+      if (!finalT.trim()) return;
+      const lower = finalT.toLowerCase().trim();
+
+      // ④ Wake-word detection: "hey/hi/ok/hello/oi lena"
+      //    Regex captures any command that follows the wake word in the SAME utterance
+      const wakeMatch = lower.match(
+        /^(?:hey|hi|ok|okay|hello|oi)\s+lena[,.\s]*(.*)/i
+      );
+      if (wakeMatch) {
+        const cmdPart = wakeMatch[1].trim();
+        if (cmdPart.length > 2) {
+          // e.g. "Hey Lena, go to finance" — process inline, no restart needed
+          processCommandRef.current(cmdPart);
+        } else {
+          // Just "Hey Lena" alone — set flag and show visual cue
+          // Do NOT stop/restart recognition — that caused the gap bug
+          awaitingCommandRef.current = true;
+          statusRef.current = 'wake-detected';
+          setStatus('wake-detected');
+          setLenaResponse("Yes? I'm listening...");
+
+          // Timeout: if no command arrives in 5 s, prompt gently
+          if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
+          awaitingTimerRef.current = setTimeout(() => {
+            if (awaitingCommandRef.current) {
+              awaitingCommandRef.current = false;
+              statusRef.current = 'listening';
+              setStatus('listening');
+              speakRef.current("I'm here whenever you're ready. Just say your command.");
+            }
+          }, 5_000);
+        }
+        return;
+      }
+
+      // ⑤ Awaiting command after wake word (user said "Hey Lena" then paused)
+      if (awaitingCommandRef.current) {
+        awaitingCommandRef.current = false;
+        if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
+        processCommandRef.current(finalT.trim());
+        return;
+      }
+
+      // ⑥ Direct command (no wake word required)
+      //    Noise filter: only process if a recognisable command keyword is present
+      const isCommand = /\b(go to|navigate|open|click|press|show me|take me|what|who|how|help|summarize|summarise|initialize|start|proceed|settings|finance|supply|manufacturing|commercial|assistant|dashboard|hr|logout|log out)\b/i.test(lower);
+      if (isCommand) {
+        processCommandRef.current(finalT.trim());
+      }
+    };
+
+    // ── onerror ───────────────────────────────
+    recognition.onerror = (event: any) => {
+      const { error } = event as { error: string };
+      // These are harmless / expected
+      if (error === 'aborted' || error === 'no-speech') return;
+      if (error === 'not-allowed') {
+        setError('Microphone access denied. Please allow microphone and refresh.');
+        isActivatedRef.current = false;
+        statusRef.current = 'idle';
+        setStatus('idle');
+        return;
+      }
+      console.warn('[Lena] Recognition error:', error);
+    };
+
+    // ── onend — indestructible restart ────────
+    // Fires whenever continuous recognition closes (timeout, error, etc.)
+    recognition.onend = () => {
+      if (isActivatedRef.current) {
+        setTimeout(() => {
+          if (isActivatedRef.current) {
+            try { recognition.start(); } catch (_) {}
+          }
+        }, 200);
+      }
+    };
+
+    // ── First-interaction gate (browser autoplay/mic policy) ──
+    const activate = () => {
+      if (isActivatedRef.current) return;
+      isActivatedRef.current = true;
+      statusRef.current = 'listening';
+      setStatus('listening');
+      setLenaResponse("Hello! I'm Lena. How can I help you today?");
+
+      try { recognition.start(); } catch (_) {}
+
+      // Greet after recognition has had time to initialise
+      setTimeout(() => {
+        speakRef.current(
+          "Hello! I'm Lena, your LENA Platform voice assistant. How can I help you today?"
+        );
+      }, 600);
+
+      window.removeEventListener('click',      activate);
+      window.removeEventListener('keydown',    activate);
+      window.removeEventListener('touchstart', activate);
+    };
+
+    window.addEventListener('click',      activate);
+    window.addEventListener('keydown',    activate);
+    window.addEventListener('touchstart', activate);
 
     return () => {
-      window.removeEventListener('click', handleFirstInteraction);
-      window.removeEventListener('keydown', handleFirstInteraction);
-      // We don't stop the recognition here to keep it alive across light renders
+      window.removeEventListener('click',      activate);
+      window.removeEventListener('keydown',    activate);
+      window.removeEventListener('touchstart', activate);
+      isActivatedRef.current = false;
+      try { recognition.stop(); } catch (_) {}
     };
-  }, [navigate, speak, isListening]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // ← intentionally empty — all callbacks accessed via refs
 
-  // --- Pipeline Voice Narration ---
+  // ════════════════════════════════════════════
+  // PIPELINE VOICE NARRATION
+  // ════════════════════════════════════════════
   useEffect(() => {
-    // Agent durations (ms): Telemetry=6000, Demand=5000, Pricing=7000,
-    // Plant=5000, Route=8000, Risk=6000, Orchestrator=5000
-    const SCRIPT = [
-      { delay: 0, text: "Initializing LENA Agent Pipeline. All systems online." },
-      { delay: 800, text: "Telemetry Agent activated — Gathered tank levels and analyzed." },
-      { delay: 6000, text: "Demand and Allocation Agent engaged — forecasting supply needs." },
-      { delay: 11000, text: "Pricing Optimisation Agent online — calculating best fuel rates." },
-      { delay: 18000, text: "Plant and Logistics Allocation Agent deployed — assigning efficient plant, tanker and driver sources." },
-      { delay: 23000, text: "Route Optimisation Agent launched — finding fastest delivery path." },
-      { delay: 31000, text: "Risk Agent standing by — evaluating financial exposure." },
-      { delay: 37000, text: "LENA Orchestrator taking control — consolidating all agent outputs." },
-      { delay: 42500, text: "Pipeline complete. All agents executed successfully." },
+    const SCRIPT: { delay: number; text: string }[] = [
+      { delay:     0, text: 'Initializing LENA Agent Pipeline. All systems are online.' },
+      { delay:   800, text: 'Telemetry Agent activated. Tank levels gathered and analysed.' },
+      { delay:  6000, text: 'Demand and Allocation Agent engaged. Forecasting supply needs across all regions.' },
+      { delay: 11000, text: 'Pricing Optimisation Agent online. Calculating the best fuel rates.' },
+      { delay: 18000, text: 'Plant and Logistics Allocation Agent deployed. Assigning efficient plant, tanker, and driver resources.' },
+      { delay: 23000, text: 'Route Optimisation Agent launched. Finding the fastest and most efficient delivery path.' },
+      { delay: 31000, text: 'Risk Agent standing by. Evaluating financial exposure and compliance risks.' },
+      { delay: 37000, text: 'LENA Orchestrator taking control. Consolidating all agent outputs.' },
+      { delay: 42500, text: 'Pipeline complete. All agents executed successfully. Results are ready for your review.' },
     ];
 
-    const handlePipelineStart = () => {
-      // Clear any existing timers
+    const onPipelineStart = () => {
       pipelineTimersRef.current.forEach(clearTimeout);
       pipelineTimersRef.current = [];
-
-      // Schedule the narration
       SCRIPT.forEach(({ delay, text }) => {
-        const t = setTimeout(() => speak(text), delay);
-        pipelineTimersRef.current.push(t);
+        pipelineTimersRef.current.push(
+          setTimeout(() => speakRef.current(text), delay)
+        );
       });
     };
 
-    window.addEventListener('lena-pipeline-start', handlePipelineStart);
+    window.addEventListener('lena-pipeline-start', onPipelineStart);
     return () => {
-      window.removeEventListener('lena-pipeline-start', handlePipelineStart);
+      window.removeEventListener('lena-pipeline-start', onPipelineStart);
       pipelineTimersRef.current.forEach(clearTimeout);
     };
-  }, [speak]);
+  }, []);
+
+  // ════════════════════════════════════════════
+  // UI
+  // ════════════════════════════════════════════
+  const STATUS_CONFIG: Record<LenaStatus, { dot: string; label: string }> = {
+    'idle':          { dot: 'bg-gray-400',                  label: 'Inactive' },
+    'listening':     { dot: 'bg-green-500 animate-pulse',   label: 'Listening...' },
+    'wake-detected': { dot: 'bg-yellow-400 animate-bounce', label: 'Awaiting command...' },
+    'processing':    { dot: 'bg-blue-400',                  label: 'Processing...' },
+    'speaking':      { dot: 'bg-primary animate-pulse',     label: 'Speaking...' },
+  };
+
+  const isActive = status === 'processing' || status === 'speaking';
 
   if (error) {
     return (
       <div className="fixed bottom-4 right-4 bg-destructive/90 text-destructive-foreground p-3 rounded-lg shadow-xl z-50 text-sm flex items-center gap-2">
-        <MicOff className="w-4 h-4" />
-        {error}
-        <button onClick={() => setError(null)}><X className="w-3 h-3" /></button>
+        <MicOff className="w-4 h-4 flex-shrink-0" />
+        <span>{error}</span>
+        <button onClick={() => setError(null)} className="ml-1 hover:opacity-70">
+          <X className="w-3 h-3" />
+        </button>
       </div>
     );
   }
 
   return (
     <AnimatePresence>
-        <motion.div
-          initial={{ opacity: 0, scale: 0.9, y: 20 }}
-          animate={{ opacity: 1, scale: 1, y: 0 }}
-          exit={{ opacity: 0, scale: 0.9, y: 20 }}
-          className="fixed bottom-6 right-6 z-[100] w-80"
-        >
-          <div className="bg-background/80 backdrop-blur-xl border border-primary/20 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
-            {/* Header */}
-            <div className="bg-primary/10 p-4 flex items-center justify-between border-b border-primary/10">
-              <div className="flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-primary animate-pulse" />
-                <span className="font-semibold text-sm tracking-tight">LENA Assistant</span>
-              </div>
-            </div>
+      <motion.div
+        initial={{ opacity: 0, scale: 0.9, y: 20 }}
+        animate={{ opacity: 1, scale: 1,   y: 0  }}
+        exit={{    opacity: 0, scale: 0.9, y: 20 }}
+        className="fixed bottom-6 right-6 z-[100] w-80"
+      >
+        <div className="bg-background/80 backdrop-blur-xl border border-primary/20 rounded-2xl shadow-2xl overflow-hidden">
 
-            {/* Content */}
-            <div className="p-4 space-y-4 max-h-96 overflow-y-auto">
-              {transcript && (
-                <div className="flex gap-2">
-                  <div className="bg-muted p-2 rounded-lg rounded-tl-none text-xs text-muted-foreground flex-1">
-                    <span className="font-bold block mb-1 opacity-50 uppercase tracking-tighter">You</span>
-                    {transcript}
-                  </div>
-                </div>
+          {/* ── Header ── */}
+          <div className="bg-primary/10 p-4 flex items-center justify-between border-b border-primary/10">
+            <div className="flex items-center gap-2">
+              <div className={`w-2 h-2 rounded-full ${STATUS_CONFIG[status].dot}`} />
+              <span className="font-semibold text-sm tracking-tight">LENA Assistant</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-muted-foreground">{STATUS_CONFIG[status].label}</span>
+              {isActive && (
+                <button
+                  onClick={stopEverything}
+                  title="Stop Lena"
+                  className="text-muted-foreground hover:text-destructive transition-colors ml-1"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
               )}
-
-              <div className="flex gap-2 justify-end">
-                <div className="bg-primary/20 p-3 rounded-lg rounded-tr-none text-sm border border-primary/10 flex-1">
-                  <span className="font-bold block mb-1 text-primary opacity-60 uppercase tracking-tighter">Lena</span>
-                  {isProcessing ? (
-                    <div className="flex items-center gap-2 text-muted-foreground italic text-xs">
-                      <Loader2 className="w-3 h-3 animate-spin" />
-                      Processing command...
-                    </div>
-                  ) : (
-                    lenaResponse || "Listening for your command..."
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Visualizer Footer */}
-            <div className="h-1 bg-primary/5 relative">
-              <motion.div
-                className="absolute inset-0 bg-primary/40"
-                animate={{
-                  scaleX: isProcessing ? [0, 1, 0.5, 1] : 1,
-                  opacity: isProcessing ? [0.5, 1, 0.5] : 0.3
-                }}
-                transition={{ repeat: Infinity, duration: 1.5 }}
-              />
             </div>
           </div>
-        </motion.div>
+
+          {/* ── Body ── */}
+          <div className="p-4 space-y-3 max-h-64 overflow-y-auto">
+            {status === 'idle' ? (
+              <p className="text-xs text-muted-foreground text-center py-3 animate-pulse">
+                Click anywhere to activate Lena
+              </p>
+            ) : (
+              <>
+                {transcript && (
+                  <div className="bg-muted/60 p-2.5 rounded-lg">
+                    <span className="block mb-1 text-muted-foreground/60 uppercase tracking-widest text-[9px] font-bold">
+                      You
+                    </span>
+                    <span className="text-xs text-foreground/80">{transcript}</span>
+                  </div>
+                )}
+
+                <div className="bg-primary/10 p-3 rounded-lg border border-primary/10">
+                  <span className="block mb-1 text-primary/60 uppercase tracking-widest text-[9px] font-bold">
+                    Lena
+                  </span>
+                  {status === 'processing' ? (
+                    <div className="flex items-center gap-2 text-muted-foreground text-xs italic">
+                      <Loader2 className="w-3 h-3 animate-spin flex-shrink-0" />
+                      Processing your command...
+                    </div>
+                  ) : (
+                    <span className="text-sm">{lenaResponse}</span>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* ── Animated bar ── */}
+          <div className="h-1 bg-primary/5 relative overflow-hidden">
+            <motion.div
+              className="absolute inset-0 bg-primary/50"
+              style={{ originX: 0 }}
+              animate={{
+                scaleX:  status === 'idle'      ? 0
+                        : status === 'listening' ? 0.25
+                        : [0.2, 1, 0.5, 1],
+                opacity: status === 'idle'      ? 0
+                        : status === 'listening' ? 0.4
+                        : [0.4, 1, 0.5],
+              }}
+              transition={{ repeat: Infinity, duration: 1.5, ease: 'easeInOut' }}
+            />
+          </div>
+
+        </div>
+      </motion.div>
     </AnimatePresence>
   );
 };
