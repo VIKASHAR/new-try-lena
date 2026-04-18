@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { MicOff, Loader2, X } from 'lucide-react';
+import { Mic, MicOff, Loader2, X, Volume2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 // ─────────────────────────────────────────────
@@ -9,8 +9,9 @@ import { motion, AnimatePresence } from 'framer-motion';
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL   = 'llama-3.3-70b-versatile';
 
-// Matches any variant of the wake word (case-insensitive, anywhere in transcript)
-const WAKE_REGEX = /\b(?:hey|hi|ok|okay|hello|oi)\s+lena\b/i;
+// Wake word: just "lena" with a word boundary catches every variant:
+// "hey lena", "ok lena", "lena go to...", "lena!" etc.
+const WAKE_REGEX = /\blena\b/i;
 
 // ─────────────────────────────────────────────
 // Types
@@ -18,47 +19,54 @@ const WAKE_REGEX = /\b(?:hey|hi|ok|okay|hello|oi)\s+lena\b/i;
 type LenaStatus = 'idle' | 'listening' | 'wake-detected' | 'processing' | 'speaking';
 
 // ─────────────────────────────────────────────
-// LenaAssistant Component
+// LenaAssistant
 // ─────────────────────────────────────────────
 export const LenaAssistant: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
 
   // ── UI state ──
-  const [status,       setStatus]       = useState<LenaStatus>('idle');
-  const [transcript,   setTranscript]   = useState('');
-  const [lenaResponse, setLenaResponse] = useState('Click anywhere to activate Lena...');
-  const [error,        setError]        = useState<string | null>(null);
+  const [status,        setStatus]        = useState<LenaStatus>('idle');
+  const [transcript,    setTranscript]    = useState('');
+  const [lenaResponse,  setLenaResponse]  = useState('');
+  const [error,         setError]         = useState<string | null>(null);
+  const [isSoundActive, setIsSoundActive] = useState(false);   // mic is picking up sound
+  const [micLevel,      setMicLevel]      = useState(0);       // 0–1 amplitude
 
-  // ── All mutable values shared across closures live in refs ──
-  const recognitionRef     = useRef<any>(null);
-  const voiceRef           = useRef<SpeechSynthesisVoice | null>(null);
-  const utteranceRef       = useRef<SpeechSynthesisUtterance | null>(null);
-  const statusRef          = useRef<LenaStatus>('idle');
-  const isActivatedRef     = useRef(false);
-  const awaitingCommandRef = useRef(false);   // true after "Hey Lena" detected
-  const awaitingTimerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pipelineTimersRef  = useRef<ReturnType<typeof setTimeout>[]>([]);
-  const resumeIntervalRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  // ── Refs ──
+  const recognitionRef      = useRef<any>(null);
+  const voiceRef            = useRef<SpeechSynthesisVoice | null>(null);
+  const utteranceRef        = useRef<SpeechSynthesisUtterance | null>(null);
+  const statusRef           = useRef<LenaStatus>('idle');
+  const isActivatedRef      = useRef(false);
+  const awaitingCommandRef  = useRef(false);
+  const awaitingTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pipelineTimersRef   = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const resumeIntervalRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isSoundActiveRef    = useRef(false);
 
-  // Keep navigate + pathname fresh without re-creating recognition
-  const navigateRef  = useRef(navigate);
-  const pathnameRef  = useRef(location.pathname);
+  // AudioContext refs for real mic-level visualization
+  const audioCtxRef         = useRef<AudioContext | null>(null);
+  const analyserRef         = useRef<AnalyserNode | null>(null);
+  const micStreamRef        = useRef<MediaStream | null>(null);
+  const animFrameRef        = useRef<number>(0);
+
+  // Keep navigate + pathname accessible from stable closures
+  const navigateRef = useRef(navigate);
+  const pathnameRef = useRef(location.pathname);
   useEffect(() => { navigateRef.current = navigate;          }, [navigate]);
   useEffect(() => { pathnameRef.current = location.pathname; }, [location.pathname]);
 
-  // ── Sync helper ──
   const setStatusBoth = useCallback((s: LenaStatus) => {
     statusRef.current = s;
     setStatus(s);
   }, []);
 
   // ════════════════════════════════════════════
-  // VOICE LOADING
-  // Priority list tuned for Chrome / Edge on Windows & Mac
+  // VOICE LOADING  (female-first priority)
   // ════════════════════════════════════════════
   useEffect(() => {
-    const loadVoice = () => {
+    const load = () => {
       const voices = window.speechSynthesis.getVoices();
       if (!voices.length) return;
 
@@ -67,38 +75,71 @@ export const LenaAssistant: React.FC = () => {
         'Microsoft Aria Online (Natural) - English (United States)',
         'Microsoft Aria - English (United States)',
         'Microsoft Zira - English (United States)',
-        'Samantha',   // macOS
-        'Victoria',   // macOS
-        'Karen',      // macOS (Australian)
-        'Moira',      // macOS (Irish)
-        'Fiona',      // macOS (Scottish)
+        'Samantha', 'Victoria', 'Karen', 'Moira', 'Fiona',
         'Google US English',
       ];
 
-      let selected: SpeechSynthesisVoice | undefined;
+      let v: SpeechSynthesisVoice | undefined;
       for (const name of PRIORITY) {
-        selected = voices.find(v => v.name.toLowerCase().includes(name.toLowerCase()));
-        if (selected) break;
+        v = voices.find(x => x.name.toLowerCase().includes(name.toLowerCase()));
+        if (v) break;
       }
-      if (!selected) selected = voices.find(v => v.lang.startsWith('en') && /female|woman/i.test(v.name));
-      if (!selected) selected = voices.find(v => v.lang === 'en-US' || v.lang === 'en-GB');
-      if (!selected) selected = voices.find(v => v.lang.startsWith('en'));
+      if (!v) v = voices.find(x => x.lang.startsWith('en') && /female|woman/i.test(x.name));
+      if (!v) v = voices.find(x => x.lang === 'en-US' || x.lang === 'en-GB');
+      if (!v) v = voices.find(x => x.lang.startsWith('en'));
 
-      voiceRef.current = selected ?? null;
-      console.log('[Lena] Voice:', voiceRef.current?.name ?? 'browser default');
+      voiceRef.current = v ?? null;
+      console.log('[Lena] Voice:', voiceRef.current?.name ?? 'default');
     };
-
-    window.speechSynthesis.onvoiceschanged = loadVoice;
-    loadVoice();
+    window.speechSynthesis.onvoiceschanged = load;
+    load();
     return () => { window.speechSynthesis.onvoiceschanged = null; };
   }, []);
 
   // ════════════════════════════════════════════
-  // SPEAK
-  // Recognition keeps running while speaking — the status gate
-  // blocks command processing; Chrome's built-in echo cancellation
-  // (AEC) handles the mic. This avoids any recognition gap.
-  // Chrome 15-second TTS bug is fixed with a resume interval.
+  // MIC LEVEL VISUALIZER  (Web Audio API)
+  // Reads the actual microphone amplitude 60×/s
+  // so the bars react in real time to the user's voice.
+  // ════════════════════════════════════════════
+  const startMicVisualizer = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      micStreamRef.current = stream;
+
+      const ctx      = new AudioContext();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 128;
+      ctx.createMediaStreamSource(stream).connect(analyser);
+
+      audioCtxRef.current  = ctx;
+      analyserRef.current  = analyser;
+
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      const tick = () => {
+        analyser.getByteFrequencyData(data);
+        // Average over first 20 bins (voice range)
+        const avg = data.slice(0, 20).reduce((a, b) => a + b, 0) / 20;
+        setMicLevel(avg / 255);
+        animFrameRef.current = requestAnimationFrame(tick);
+      };
+      tick();
+    } catch (err) {
+      console.warn('[Lena] Visualizer error:', err);
+    }
+  }, []);
+
+  const stopMicVisualizer = useCallback(() => {
+    cancelAnimationFrame(animFrameRef.current);
+    audioCtxRef.current?.close();
+    micStreamRef.current?.getTracks().forEach(t => t.stop());
+    audioCtxRef.current = null;
+    analyserRef.current = null;
+    micStreamRef.current = null;
+    setMicLevel(0);
+  }, []);
+
+  // ════════════════════════════════════════════
+  // SPEAK  (always female voice, Chrome 15-s fix)
   // ════════════════════════════════════════════
   const speak = useCallback((text: string) => {
     if (!window.speechSynthesis || !text.trim()) return;
@@ -107,17 +148,17 @@ export const LenaAssistant: React.FC = () => {
     if (resumeIntervalRef.current) clearInterval(resumeIntervalRef.current);
 
     const utterance = new SpeechSynthesisUtterance(text);
-    utteranceRef.current = utterance; // keep reference to prevent Chrome GC bug
+    utteranceRef.current = utterance;
 
     if (voiceRef.current) utterance.voice = voiceRef.current;
-    utterance.pitch  = 1.15;  // slightly higher = more feminine
+    utterance.pitch  = 1.15;
     utterance.rate   = 1.0;
     utterance.volume = 1.0;
 
     setStatusBoth('speaking');
     setLenaResponse(text);
 
-    // Chrome silently stops TTS after ~15 s on some versions
+    // Chrome 15-s TTS bug workaround
     resumeIntervalRef.current = setInterval(() => {
       if (window.speechSynthesis.paused) window.speechSynthesis.resume();
     }, 8_000);
@@ -128,20 +169,14 @@ export const LenaAssistant: React.FC = () => {
         setStatusBoth('listening');
       }
     };
-
     utterance.onend   = onDone;
-    utterance.onerror = (e) => {
-      if (e.error !== 'interrupted') console.warn('[Lena] TTS error:', e.error);
-      onDone();
-    };
+    utterance.onerror = (e) => { if (e.error !== 'interrupted') console.warn('[Lena] TTS:', e.error); onDone(); };
 
     window.speechSynthesis.speak(utterance);
   }, [setStatusBoth]);
 
   // ════════════════════════════════════════════
   // STOP EVERYTHING
-  // Does NOT speak (avoids "stop" echo loop).
-  // Cancels TTS + all pending timers, returns to listening.
   // ════════════════════════════════════════════
   const stopEverything = useCallback(() => {
     window.speechSynthesis.cancel();
@@ -176,9 +211,7 @@ export const LenaAssistant: React.FC = () => {
     }
 
     try {
-      const pageElements = Array.from(
-        document.querySelectorAll('button, a, [role="button"]')
-      )
+      const pageElements = Array.from(document.querySelectorAll('button, a, [role="button"]'))
         .map(el => el.textContent?.trim())
         .filter((t): t is string => !!t && t.length < 60)
         .slice(0, 25)
@@ -194,35 +227,28 @@ Available navigation routes:
 
 Parse the user's voice command and return a JSON object.
 
-CRITICAL RULES:
-1. "response" is ALWAYS mandatory — it is what Lena speaks aloud. Keep it 1–2 warm, professional sentences.
-2. For navigation: type="NAVIGATE", payload=the exact route path.
-3. For clicking a button: type="CLICK", payload=exact button label.
+RULES:
+1. "response" is ALWAYS mandatory — what Lena speaks aloud. 1–2 warm sentences.
+2. For navigation: type="NAVIGATE", payload=route path.
+3. For button clicks: type="CLICK", payload=exact button label.
 4. For page summary: type="SUMMARIZE".
-5. For greetings/general questions: type="CHAT".
+5. For greetings/chat: type="CHAT".
 6. Every action MUST have a spoken verbal confirmation in "response".
-7. Never leave "response" empty or null.
 
-Return strict JSON only — no markdown, no extra text:
+Return strict JSON only:
 {
   "type": "NAVIGATE" | "CLICK" | "SUMMARIZE" | "CHAT",
-  "payload": "route path or button label or null",
-  "response": "What Lena will say (MANDATORY)"
+  "payload": "route or button or null",
+  "response": "Lena speaks this (MANDATORY)"
 }`;
 
       const res = await fetch(GROQ_API_URL, {
         method: 'POST',
-        headers: {
-          Authorization:  `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model:           GROQ_MODEL,
           temperature:     0.3,
-          messages:        [
-            { role: 'system', content: systemPrompt },
-            { role: 'user',   content: text },
-          ],
+          messages:        [{ role: 'system', content: systemPrompt }, { role: 'user', content: text }],
           response_format: { type: 'json_object' },
         }),
       });
@@ -232,49 +258,35 @@ Return strict JSON only — no markdown, no extra text:
       const data   = await res.json();
       const action = JSON.parse(data.choices[0].message.content);
 
-      // ① Speak the confirmation (always)
       speak(action.response || 'Done.');
 
-      // ② Execute the action after a brief pause
       setTimeout(() => {
         switch (action.type) {
           case 'NAVIGATE':
             if (action.payload) navigateRef.current(action.payload);
             break;
-
           case 'CLICK': {
             if (!action.payload) break;
-            const els    = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-            const target = els.find(el =>
-              el.textContent?.toLowerCase().includes(action.payload.toLowerCase())
-            ) as HTMLElement | undefined;
-            if (target) {
-              target.click();
-            } else {
-              setTimeout(() => speak(`I couldn't find a button labelled "${action.payload}". Could you try again?`), 600);
-            }
+            const target = Array.from(document.querySelectorAll('button, a, [role="button"]'))
+              .find(el => el.textContent?.toLowerCase().includes(action.payload.toLowerCase())) as HTMLElement | undefined;
+            if (target) target.click();
+            else setTimeout(() => speak(`I couldn't find a button labelled "${action.payload}". Please try again.`), 600);
             break;
           }
-
           case 'SUMMARIZE': {
-            const content = (document.querySelector('main') as HTMLElement | null)?.innerText
-              ?? document.body.innerText;
+            const content = (document.querySelector('main') as HTMLElement | null)?.innerText ?? document.body.innerText;
             getSummaryFromGroq(content.slice(0, 5_000)).then(speak);
             break;
           }
-
-          default:
-            break;
         }
       }, 250);
 
     } catch (err) {
       console.error('[Lena] Command error:', err);
-      speak('I encountered an error while processing your request. Please try again.');
+      speak('I encountered an error. Please try again.');
     }
   }, [speak, setStatusBoth]);
 
-  // ─── Groq page summarisation ─────────────────
   const getSummaryFromGroq = async (content: string): Promise<string> => {
     const apiKey = import.meta.env.VITE_GROQ_API_KEY;
     try {
@@ -284,19 +296,17 @@ Return strict JSON only — no markdown, no extra text:
         body: JSON.stringify({
           model:    GROQ_MODEL,
           messages: [
-            { role: 'system', content: 'You are Lena, a professional female assistant. Summarise this page in 2–3 clear sentences for voice delivery. Be concise.' },
+            { role: 'system', content: 'You are Lena. Summarise this page in 2–3 sentences for voice.' },
             { role: 'user',   content },
           ],
         }),
       });
       const data = await res.json();
       return data.choices[0].message.content as string;
-    } catch {
-      return 'I was unable to summarise the page content at this time.';
-    }
+    } catch { return 'I was unable to summarise the page at this time.'; }
   };
 
-  // ─── Keep callback refs fresh for the stable recognition closure ──
+  // Callback refs — keep recognition closure up-to-date
   const processCommandRef = useRef(processCommand);
   const stopEverythingRef = useRef(stopEverything);
   const speakRef          = useRef(speak);
@@ -305,34 +315,67 @@ Return strict JSON only — no markdown, no extra text:
   useEffect(() => { speakRef.current          = speak;          }, [speak]);
 
   // ════════════════════════════════════════════
-  // SPEECH RECOGNITION  (runs exactly ONCE, empty deps)
-  //
-  // Key design choices:
-  //
-  // 1. continuous=true — recognition never manually stopped from onresult.
-  //    Stopping inside onresult caused a ~200 ms gap that swallowed
-  //    the command spoken right after "Hey Lena".
-  //
-  // 2. Wake-word pre-armed on INTERIM results.
-  //    Chrome fires interim events while the user is still speaking.
-  //    By setting awaitingCommandRef=true on the first interim that
-  //    contains "hey lena", we are ready before the final result arrives.
-  //    When "hey lena" becomes final and there is NO command attached,
-  //    the next final transcript (the actual command) is captured
-  //    immediately with awaitingCommandRef=true still set.
-  //
-  // 3. onend restart delay is 50 ms when awaitingCommand is true
-  //    (vs 200 ms normally) to minimise the gap if Chrome briefly
-  //    ends continuous mode after silence.
-  //
-  // 4. "stop" is checked BEFORE every other gate so it always fires,
-  //    even while Lena is speaking.
+  // EXPLICIT ACTIVATION  (called by the Activate button)
+  // 1. Requests mic via getUserMedia → triggers browser permission dialog
+  // 2. Starts the Web Audio visualizer
+  // 3. Starts SpeechRecognition
+  // 4. Greets the user
+  // ════════════════════════════════════════════
+  const handleActivate = useCallback(async () => {
+    if (isActivatedRef.current) return;
+
+    try {
+      // This line triggers the browser "Allow microphone?" dialog
+      await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    } catch {
+      setError('Microphone access denied. Click the lock icon in the address bar and allow microphone, then refresh.');
+      return;
+    }
+
+    isActivatedRef.current = true;
+    setStatusBoth('listening');
+    setLenaResponse("Hello! I'm Lena. How can I help?");
+
+    // Start real mic-level visualizer
+    startMicVisualizer();
+
+    // Start recognition
+    if (recognitionRef.current) {
+      try { recognitionRef.current.start(); } catch (_) {}
+    }
+
+    // Greet
+    setTimeout(() => {
+      speakRef.current(
+        "Hello! I'm Lena, your LENA Platform voice assistant. Say my name or tap the mic button to give me a command."
+      );
+    }, 400);
+  }, [setStatusBoth, startMicVisualizer]);
+
+  // ════════════════════════════════════════════
+  // TAP-TO-SPEAK  (manual command trigger button)
+  // Arms awaitingCommand immediately — user just speaks their command
+  // ════════════════════════════════════════════
+  const handleTapToSpeak = useCallback(() => {
+    if (!isActivatedRef.current || statusRef.current === 'processing' || statusRef.current === 'speaking') return;
+    awaitingCommandRef.current = true;
+    setStatusBoth('wake-detected');
+    setLenaResponse("Go ahead, I'm listening...");
+    if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
+    awaitingTimerRef.current = setTimeout(() => {
+      if (awaitingCommandRef.current) {
+        awaitingCommandRef.current = false;
+        setStatusBoth('listening');
+        setLenaResponse('Listening...');
+      }
+    }, 8_000);
+  }, [setStatusBoth]);
+
+  // ════════════════════════════════════════════
+  // SPEECH RECOGNITION SETUP  (runs once, empty deps)
   // ════════════════════════════════════════════
   useEffect(() => {
-    const SR =
-      (window as any).SpeechRecognition ??
-      (window as any).webkitSpeechRecognition;
-
+    const SR = (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition;
     if (!SR) {
       setError('Speech recognition not supported. Please use Chrome or Edge.');
       return;
@@ -345,73 +388,75 @@ Return strict JSON only — no markdown, no extra text:
     recognition.maxAlternatives = 1;
     recognitionRef.current      = recognition;
 
+    // ─── Sound / speech activity events ──────
+    // These drive the mic-active indicator
+    recognition.onsoundstart  = () => { isSoundActiveRef.current = true;  setIsSoundActive(true);  };
+    recognition.onsoundend    = () => { isSoundActiveRef.current = false; setIsSoundActive(false); };
+    recognition.onspeechstart = () => { isSoundActiveRef.current = true;  setIsSoundActive(true);  };
+    recognition.onspeechend   = () => { isSoundActiveRef.current = false; setIsSoundActive(false); };
+    recognition.onaudiostart  = () => console.log('[Lena] 🎙 Audio capture started');
+    recognition.onaudioend    = () => console.log('[Lena] 🎙 Audio capture ended');
+
     // ─── onresult ────────────────────────────
     recognition.onresult = (event: any) => {
-      let finalT   = '';
+      let finalT  = '';
       let interimT = '';
-
       for (let i = event.resultIndex; i < event.results.length; ++i) {
         const t = event.results[i][0].transcript as string;
         if (event.results[i].isFinal) finalT   += t;
         else                          interimT  += t;
       }
 
-      const anyText     = (finalT || interimT).trim();
-      const anyLower    = anyText.toLowerCase();
+      const anyLower = (finalT || interimT).toLowerCase().trim();
 
-      // ① STOP — always active (even while speaking)
-      if (anyLower.includes('stop')) {
-        stopEverythingRef.current();
-        return;
-      }
+      // ① STOP — always fires even while speaking
+      if (anyLower.includes('stop')) { stopEverythingRef.current(); return; }
 
-      // ② Gate: ignore non-stop input while speaking or processing
+      // ② Gate while speaking or processing
       if (statusRef.current === 'speaking' || statusRef.current === 'processing') return;
 
-      // ③ PRE-ARM wake word from INTERIM results
-      //    As soon as we see "hey lena" in the partial transcript,
-      //    flag awaitingCommand — so we don't miss the command that follows.
+      // ③ PRE-ARM on interim — detect "lena" as early as possible
       if (
         !awaitingCommandRef.current &&
-        statusRef.current !== 'wake-detected' &&
+        statusRef.current === 'listening' &&
         WAKE_REGEX.test(anyLower) &&
-        !finalT.trim()            // only act on interim here
+        !finalT.trim()
       ) {
         awaitingCommandRef.current = true;
         statusRef.current = 'wake-detected';
         setStatus('wake-detected');
         setLenaResponse("Yes? I'm listening...");
-        // (Re-)set the timeout in case the final result takes a moment)
         if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
         awaitingTimerRef.current = setTimeout(() => {
           if (awaitingCommandRef.current) {
             awaitingCommandRef.current = false;
             statusRef.current = 'listening';
             setStatus('listening');
-            speakRef.current("I'm here whenever you're ready. Just say your command.");
+            speakRef.current("I'm here. Just say your command whenever you're ready.");
           }
         }, 7_000);
       }
 
-      // ④ From here, only act on FINAL transcripts
+      // ④ Only act on FINAL transcripts from here
       if (!finalT.trim()) return;
       const lower = finalT.toLowerCase().trim();
 
-      // ⑤ Wake word in FINAL result — extract any trailing command
+      // ⑤ Final transcript contains "lena" — extract trailing command
       if (WAKE_REGEX.test(lower)) {
-        // Strip the wake word phrase (and surrounding punctuation/spaces)
+        // Strip "lena" and any preceding wake prefixes + punctuation
         const commandPart = lower
-          .replace(WAKE_REGEX, '')
-          .replace(/^[,.\s!?]+/, '')
+          .replace(/\b(?:hey|hi|ok|okay|hello|oi)\s+lena\b/gi, '')
+          .replace(/\blena\b/gi, '')
+          .replace(/^[\s,.\-!?]+/, '')
           .trim();
 
         if (commandPart.length > 2) {
-          // "Hey Lena, go to finance" — process inline
+          // "Hey Lena go to finance" → process "go to finance"
           awaitingCommandRef.current = false;
           if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
           processCommandRef.current(commandPart);
         } else {
-          // Just "Hey Lena" — arm already set in step ③ or set here
+          // Just "Lena" alone → arm and wait
           awaitingCommandRef.current = true;
           statusRef.current = 'wake-detected';
           setStatus('wake-detected');
@@ -422,14 +467,14 @@ Return strict JSON only — no markdown, no extra text:
               awaitingCommandRef.current = false;
               statusRef.current = 'listening';
               setStatus('listening');
-              speakRef.current("I'm here whenever you're ready. Just say your command.");
+              speakRef.current("I'm here. Just say your command whenever you're ready.");
             }
           }, 7_000);
         }
         return;
       }
 
-      // ⑥ Awaiting command (after "Hey Lena" was detected separately)
+      // ⑥ Awaiting command (after wake word was detected separately)
       if (awaitingCommandRef.current) {
         awaitingCommandRef.current = false;
         if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
@@ -439,9 +484,11 @@ Return strict JSON only — no markdown, no extra text:
         return;
       }
 
-      // ⑦ Direct command (no wake word needed — filtered by keywords to reduce noise)
-      const isDirectCommand = /\b(go to|navigate|open|click|press|show|take me|what|who|how|help|summarize|summarise|initialize|start|proceed|settings|finance|supply|manufacturing|commercial|assistant|dashboard|hr|logout|log out)\b/i.test(lower);
-      if (isDirectCommand) {
+      // ⑦ Direct command — accept anything with 3+ words OR recognisable terms
+      //    (No wake word needed; Groq handles interpretation)
+      const words = lower.trim().split(/\s+/);
+      const hasCommandKeyword = /\b(go|open|navigate|click|show|take|help|summarize|summarise|initialize|start|finance|supply|manufacturing|commercial|settings|assistant|dashboard|hr|logout)\b/i.test(lower);
+      if (words.length >= 3 || hasCommandKeyword) {
         processCommandRef.current(finalT.trim());
       }
     };
@@ -449,9 +496,9 @@ Return strict JSON only — no markdown, no extra text:
     // ─── onerror ─────────────────────────────
     recognition.onerror = (event: any) => {
       const { error } = event as { error: string };
-      if (error === 'aborted' || error === 'no-speech') return; // harmless
+      if (error === 'aborted' || error === 'no-speech') return;
       if (error === 'not-allowed') {
-        setError('Microphone access denied. Please allow microphone and refresh.');
+        setError('Microphone access denied. Please allow microphone in your browser and refresh.');
         isActivatedRef.current = false;
         statusRef.current = 'idle';
         setStatus('idle');
@@ -461,9 +508,6 @@ Return strict JSON only — no markdown, no extra text:
     };
 
     // ─── onend — indestructible restart ──────
-    // Uses a SHORTER delay when we are waiting for a command after
-    // "Hey Lena", to minimise any gap caused by Chrome briefly
-    // ending continuous recognition on silence.
     recognition.onend = () => {
       if (!isActivatedRef.current) return;
       const delay = awaitingCommandRef.current ? 50 : 200;
@@ -474,93 +518,71 @@ Return strict JSON only — no markdown, no extra text:
       }, delay);
     };
 
-    // ─── Activation (first user interaction) ─
-    const activate = () => {
-      if (isActivatedRef.current) return;
-      isActivatedRef.current = true;
-      statusRef.current = 'listening';
-      setStatus('listening');
-      setLenaResponse("Hello! I'm Lena. How can I help you today?");
-      try { recognition.start(); } catch (_) {}
-
-      // Greet after recognition has stabilised
-      setTimeout(() => {
-        speakRef.current(
-          "Hello! I'm Lena, your LENA Platform voice assistant. How can I help you today?"
-        );
-      }, 600);
-
-      window.removeEventListener('click',      activate);
-      window.removeEventListener('keydown',    activate);
-      window.removeEventListener('touchstart', activate);
-    };
-
-    window.addEventListener('click',      activate);
-    window.addEventListener('keydown',    activate);
-    window.addEventListener('touchstart', activate);
-
     return () => {
-      window.removeEventListener('click',      activate);
-      window.removeEventListener('keydown',    activate);
-      window.removeEventListener('touchstart', activate);
       isActivatedRef.current = false;
       try { recognition.stop(); } catch (_) {}
+      stopMicVisualizer();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // ← intentionally empty: all live callbacks accessed via refs
+  }, []);
 
   // ════════════════════════════════════════════
-  // PIPELINE VOICE NARRATION
+  // PIPELINE NARRATION
   // ════════════════════════════════════════════
   useEffect(() => {
     const SCRIPT = [
       { delay:     0, text: 'Initializing LENA Agent Pipeline. All systems are online.' },
       { delay:   800, text: 'Telemetry Agent activated. Tank levels gathered and analysed.' },
-      { delay:  6000, text: 'Demand and Allocation Agent engaged. Forecasting supply needs across all regions.' },
+      { delay:  6000, text: 'Demand and Allocation Agent engaged. Forecasting supply needs.' },
       { delay: 11000, text: 'Pricing Optimisation Agent online. Calculating the best fuel rates.' },
-      { delay: 18000, text: 'Plant and Logistics Allocation Agent deployed. Assigning efficient plant, tanker, and driver resources.' },
-      { delay: 23000, text: 'Route Optimisation Agent launched. Finding the fastest and most efficient delivery path.' },
+      { delay: 18000, text: 'Plant and Logistics Allocation Agent deployed. Assigning plant, tanker, and driver resources.' },
+      { delay: 23000, text: 'Route Optimisation Agent launched. Finding the fastest delivery path.' },
       { delay: 31000, text: 'Risk Agent standing by. Evaluating financial exposure and compliance risks.' },
       { delay: 37000, text: 'LENA Orchestrator taking control. Consolidating all agent outputs.' },
       { delay: 42500, text: 'Pipeline complete. All agents executed successfully. Results are ready for your review.' },
     ];
-
-    const onPipelineStart = () => {
+    const onStart = () => {
       pipelineTimersRef.current.forEach(clearTimeout);
       pipelineTimersRef.current = [];
       SCRIPT.forEach(({ delay, text }) => {
         pipelineTimersRef.current.push(setTimeout(() => speakRef.current(text), delay));
       });
     };
-
-    window.addEventListener('lena-pipeline-start', onPipelineStart);
+    window.addEventListener('lena-pipeline-start', onStart);
     return () => {
-      window.removeEventListener('lena-pipeline-start', onPipelineStart);
+      window.removeEventListener('lena-pipeline-start', onStart);
       pipelineTimersRef.current.forEach(clearTimeout);
     };
   }, []);
 
   // ════════════════════════════════════════════
-  // UI
-  // z-[9999] ensures Lena is always on top regardless of which
-  // layout (SystemLayout / Layout / LandingPage) is active.
+  // UI HELPERS
   // ════════════════════════════════════════════
-  const STATUS_CONFIG: Record<LenaStatus, { dot: string; label: string }> = {
-    'idle':          { dot: 'bg-gray-400',                  label: 'Inactive'           },
-    'listening':     { dot: 'bg-green-500 animate-pulse',   label: 'Listening...'       },
-    'wake-detected': { dot: 'bg-yellow-400 animate-bounce', label: 'Awaiting command...' },
-    'processing':    { dot: 'bg-blue-400',                  label: 'Processing...'      },
-    'speaking':      { dot: 'bg-primary animate-pulse',     label: 'Speaking...'        },
+  const STATUS_LABEL: Record<LenaStatus, string> = {
+    idle:           'Inactive',
+    listening:      'Listening...',
+    'wake-detected':'Awaiting command...',
+    processing:     'Processing...',
+    speaking:       'Speaking...',
   };
+
+  // Mic bar heights driven by actual mic amplitude (micLevel 0–1)
+  // Falls back to gentle idle animation when no sound
+  const BAR_COUNT = 5;
+  const micBars = Array.from({ length: BAR_COUNT }, (_, i) => {
+    const base = 15 + i * 5;
+    const peak = isSoundActive ? Math.min(100, base + micLevel * 80 + Math.sin(i * 1.3) * 20) : base + 5;
+    return Math.round(peak);
+  });
 
   const canStop = status === 'processing' || status === 'speaking';
 
   if (error) {
     return (
-      <div className="fixed bottom-4 right-4 z-[9999] bg-destructive/90 text-destructive-foreground p-3 rounded-lg shadow-xl text-sm flex items-center gap-2">
+      <div className="fixed bottom-4 right-4 z-[9999] bg-destructive/90 text-destructive-foreground p-3 rounded-lg shadow-xl text-sm flex items-center gap-2 max-w-xs">
         <MicOff className="w-4 h-4 flex-shrink-0" />
-        <span>{error}</span>
-        <button onClick={() => setError(null)} className="ml-1 hover:opacity-70">
+        <span className="flex-1">{error}</span>
+        <button onClick={() => setError(null)} className="ml-1 hover:opacity-70 flex-shrink-0">
           <X className="w-3 h-3" />
         </button>
       </div>
@@ -573,25 +595,32 @@ Return strict JSON only — no markdown, no extra text:
         initial={{ opacity: 0, scale: 0.9, y: 20 }}
         animate={{ opacity: 1, scale: 1,   y: 0  }}
         exit={{    opacity: 0, scale: 0.9, y: 20 }}
-        // z-[9999] overrides all layouts including SystemLayout's SidebarProvider
         className="fixed bottom-6 right-6 z-[9999] w-80"
       >
-        <div className="bg-background/80 backdrop-blur-xl border border-primary/20 rounded-2xl shadow-2xl overflow-hidden">
+        <div className="bg-background/90 backdrop-blur-xl border border-primary/20 rounded-2xl shadow-2xl overflow-hidden">
 
           {/* ── Header ── */}
-          <div className="bg-primary/10 p-4 flex items-center justify-between border-b border-primary/10">
+          <div className="bg-primary/10 px-4 py-3 flex items-center justify-between border-b border-primary/10">
             <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${STATUS_CONFIG[status].dot}`} />
+              {/* Animated status dot */}
+              <motion.div
+                className={`w-2 h-2 rounded-full ${
+                  status === 'idle'           ? 'bg-gray-400' :
+                  status === 'listening'      ? 'bg-green-500' :
+                  status === 'wake-detected'  ? 'bg-yellow-400' :
+                  status === 'processing'     ? 'bg-blue-400' :
+                                               'bg-primary'
+                }`}
+                animate={{ scale: ['idle','listening','wake-detected','speaking'].includes(status) ? [1, 1.3, 1] : 1 }}
+                transition={{ repeat: Infinity, duration: 1.2 }}
+              />
               <span className="font-semibold text-sm tracking-tight">LENA Assistant</span>
             </div>
+
             <div className="flex items-center gap-2">
-              <span className="text-xs text-muted-foreground">{STATUS_CONFIG[status].label}</span>
+              <span className="text-xs text-muted-foreground">{STATUS_LABEL[status]}</span>
               {canStop && (
-                <button
-                  onClick={stopEverything}
-                  title="Stop Lena"
-                  className="text-muted-foreground hover:text-destructive transition-colors ml-1"
-                >
+                <button onClick={stopEverything} title="Stop" className="text-muted-foreground hover:text-destructive transition-colors ml-1">
                   <X className="w-3.5 h-3.5" />
                 </button>
               )}
@@ -599,62 +628,115 @@ Return strict JSON only — no markdown, no extra text:
           </div>
 
           {/* ── Body ── */}
-          <div className="p-4 space-y-3 max-h-64 overflow-y-auto">
+          <div className="p-4 space-y-3">
+
+            {/* IDLE: big activate button */}
             {status === 'idle' ? (
-              <p className="text-xs text-muted-foreground text-center py-3 animate-pulse">
-                Click anywhere to activate Lena
-              </p>
+              <div className="flex flex-col items-center gap-3 py-4">
+                <p className="text-xs text-muted-foreground text-center">
+                  Click below to activate Lena and allow microphone access.
+                </p>
+                <motion.button
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={handleActivate}
+                  className="flex items-center gap-2 px-5 py-2.5 bg-primary text-primary-foreground rounded-xl text-sm font-semibold shadow-lg shadow-primary/30"
+                >
+                  <Mic className="w-4 h-4" />
+                  Activate Lena
+                </motion.button>
+              </div>
+
             ) : (
               <>
+                {/* Transcript bubble */}
                 {transcript && (
-                  <div className="bg-muted/60 p-2.5 rounded-lg">
-                    <span className="block mb-1 text-muted-foreground/60 uppercase tracking-widest text-[9px] font-bold">
-                      You
-                    </span>
+                  <div className="bg-muted/60 px-3 py-2 rounded-lg">
+                    <span className="block mb-0.5 text-muted-foreground/60 uppercase tracking-widest text-[9px] font-bold">You</span>
                     <span className="text-xs text-foreground/80">{transcript}</span>
                   </div>
                 )}
 
-                <div className="bg-primary/10 p-3 rounded-lg border border-primary/10">
-                  <span className="block mb-1 text-primary/60 uppercase tracking-widest text-[9px] font-bold">
-                    Lena
-                  </span>
+                {/* Lena response bubble */}
+                <div className="bg-primary/10 px-3 py-2.5 rounded-lg border border-primary/10 min-h-[52px]">
+                  <span className="block mb-0.5 text-primary/60 uppercase tracking-widest text-[9px] font-bold">Lena</span>
                   {status === 'processing' ? (
                     <div className="flex items-center gap-2 text-muted-foreground text-xs italic">
                       <Loader2 className="w-3 h-3 animate-spin flex-shrink-0" />
                       Processing your command...
                     </div>
                   ) : (
-                    <span className="text-sm">{lenaResponse}</span>
+                    <span className="text-sm leading-snug">{lenaResponse || 'Listening for your command...'}</span>
                   )}
                 </div>
 
-                {/* Wake-word tip — only shown briefly when status is listening */}
-                {status === 'listening' && (
+                {/* ── Mic visualizer row ── */}
+                <div className="flex items-center justify-between px-1">
+                  {/* Real-time audio bars */}
+                  <div className="flex items-end gap-[3px] h-6">
+                    {micBars.map((h, i) => (
+                      <motion.div
+                        key={i}
+                        className={`w-1 rounded-full ${isSoundActive ? 'bg-green-500' : 'bg-primary/30'}`}
+                        animate={{ height: `${h}%` }}
+                        transition={{ duration: 0.08, ease: 'linear' }}
+                        style={{ minHeight: 3 }}
+                      />
+                    ))}
+
+                    {/* Mic active text */}
+                    <span className={`ml-1.5 text-[9px] font-semibold uppercase tracking-wider ${isSoundActive ? 'text-green-500' : 'text-muted-foreground/40'}`}>
+                      {isSoundActive ? 'Hearing you' : 'Mic active'}
+                    </span>
+                  </div>
+
+                  {/* Tap-to-speak button */}
+                  <motion.button
+                    whileHover={{ scale: 1.1 }}
+                    whileTap={{ scale: 0.9 }}
+                    onClick={handleTapToSpeak}
+                    disabled={status === 'processing' || status === 'speaking'}
+                    title="Tap to give a command"
+                    className={`flex items-center justify-center w-8 h-8 rounded-full transition-colors ${
+                      status === 'wake-detected'
+                        ? 'bg-yellow-400/20 text-yellow-500 ring-2 ring-yellow-400/40'
+                        : 'bg-primary/10 text-primary hover:bg-primary/20'
+                    } disabled:opacity-40`}
+                  >
+                    {status === 'speaking' ? <Volume2 className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
+                  </motion.button>
+                </div>
+
+                {/* Hint text */}
+                {(status === 'listening') && (
                   <p className="text-[10px] text-muted-foreground/40 text-center">
-                    Say <span className="font-semibold text-primary/40">"Hey Lena"</span> or speak a command directly
+                    Say <span className="font-semibold text-primary/50">"Lena, go to Finance"</span> or tap 🎙 to speak
+                  </p>
+                )}
+                {status === 'wake-detected' && (
+                  <p className="text-[10px] text-yellow-500/70 text-center animate-pulse">
+                    🎙 Listening for your command...
                   </p>
                 )}
               </>
             )}
           </div>
 
-          {/* ── Animated activity bar ── */}
-          <div className="h-1 bg-primary/5 relative overflow-hidden">
+          {/* ── Activity bar ── */}
+          <div className="h-0.5 bg-primary/5 relative overflow-hidden">
             <motion.div
-              className="absolute inset-0 bg-primary/50"
+              className="absolute inset-0 bg-primary/60"
               style={{ originX: 0 }}
               animate={{
                 scaleX:  status === 'idle'           ? 0
-                        : status === 'listening'      ? 0.25
-                        : status === 'wake-detected'  ? 0.6
-                        : [0.2, 1, 0.5, 1],
+                        : status === 'listening'      ? (isSoundActive ? 0.6 : 0.2)
+                        : status === 'wake-detected'  ? 0.7
+                        : [0.2, 1, 0.4, 1],
                 opacity: status === 'idle'            ? 0
-                        : status === 'listening'       ? 0.35
-                        : status === 'wake-detected'   ? 0.7
+                        : status === 'listening'       ? (isSoundActive ? 0.8 : 0.3)
                         : [0.4, 1, 0.5],
               }}
-              transition={{ repeat: Infinity, duration: 1.5, ease: 'easeInOut' }}
+              transition={{ repeat: Infinity, duration: 1.2, ease: 'easeInOut' }}
             />
           </div>
 
