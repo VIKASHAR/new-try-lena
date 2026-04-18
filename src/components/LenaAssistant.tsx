@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { Mic, MicOff, Loader2, X, Volume2 } from 'lucide-react';
+import { Mic, MicOff, Loader2, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 // ─────────────────────────────────────────────
@@ -347,29 +347,11 @@ Return strict JSON only:
     // Greet
     setTimeout(() => {
       speakRef.current(
-        "Hello! I'm Lena, your LENA Platform voice assistant. Say my name or tap the mic button to give me a command."
+        "Hello! I'm Lena, your LENA Platform voice assistant. I'm always listening — just say Lena followed by your command."
       );
     }, 400);
   }, [setStatusBoth, startMicVisualizer]);
 
-  // ════════════════════════════════════════════
-  // TAP-TO-SPEAK  (manual command trigger button)
-  // Arms awaitingCommand immediately — user just speaks their command
-  // ════════════════════════════════════════════
-  const handleTapToSpeak = useCallback(() => {
-    if (!isActivatedRef.current || statusRef.current === 'processing' || statusRef.current === 'speaking') return;
-    awaitingCommandRef.current = true;
-    setStatusBoth('wake-detected');
-    setLenaResponse("Go ahead, I'm listening...");
-    if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
-    awaitingTimerRef.current = setTimeout(() => {
-      if (awaitingCommandRef.current) {
-        awaitingCommandRef.current = false;
-        setStatusBoth('listening');
-        setLenaResponse('Listening...');
-      }
-    }, 8_000);
-  }, [setStatusBoth]);
 
   // ════════════════════════════════════════════
   // SPEECH RECOGNITION SETUP  (runs once, empty deps)
@@ -670,10 +652,10 @@ Return strict JSON only:
                   )}
                 </div>
 
-                {/* ── Mic visualizer row ── */}
-                <div className="flex items-center justify-between px-1">
+                {/* ── Mic visualizer ── */}
+                <div className="flex items-center gap-3 px-1">
                   {/* Real-time audio bars */}
-                  <div className="flex items-end gap-[3px] h-6">
+                  <div className="flex items-end gap-[3px] h-6 flex-shrink-0">
                     {micBars.map((h, i) => (
                       <motion.div
                         key={i}
@@ -683,41 +665,25 @@ Return strict JSON only:
                         style={{ minHeight: 3 }}
                       />
                     ))}
-
-                    {/* Mic active text */}
-                    <span className={`ml-1.5 text-[9px] font-semibold uppercase tracking-wider ${isSoundActive ? 'text-green-500' : 'text-muted-foreground/40'}`}>
-                      {isSoundActive ? 'Hearing you' : 'Mic active'}
-                    </span>
                   </div>
 
-                  {/* Tap-to-speak button */}
-                  <motion.button
-                    whileHover={{ scale: 1.1 }}
-                    whileTap={{ scale: 0.9 }}
-                    onClick={handleTapToSpeak}
-                    disabled={status === 'processing' || status === 'speaking'}
-                    title="Tap to give a command"
-                    className={`flex items-center justify-center w-8 h-8 rounded-full transition-colors ${
-                      status === 'wake-detected'
-                        ? 'bg-yellow-400/20 text-yellow-500 ring-2 ring-yellow-400/40'
-                        : 'bg-primary/10 text-primary hover:bg-primary/20'
-                    } disabled:opacity-40`}
-                  >
-                    {status === 'speaking' ? <Volume2 className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
-                  </motion.button>
+                  {/* Status hint — always-on messaging */}
+                  {status === 'listening' && (
+                    <p className={`text-[10px] font-medium ${isSoundActive ? 'text-green-500' : 'text-muted-foreground/40'}`}>
+                      {isSoundActive ? 'Hearing you...' : 'Say "Lena, go to Finance"'}
+                    </p>
+                  )}
+                  {status === 'wake-detected' && (
+                    <p className="text-[10px] text-yellow-500/80 font-semibold animate-pulse">
+                      Listening for your command...
+                    </p>
+                  )}
+                  {status === 'speaking' && (
+                    <p className="text-[10px] text-primary/60 font-medium">
+                      Speaking...
+                    </p>
+                  )}
                 </div>
-
-                {/* Hint text */}
-                {(status === 'listening') && (
-                  <p className="text-[10px] text-muted-foreground/40 text-center">
-                    Say <span className="font-semibold text-primary/50">"Lena, go to Finance"</span> or tap 🎙 to speak
-                  </p>
-                )}
-                {status === 'wake-detected' && (
-                  <p className="text-[10px] text-yellow-500/70 text-center animate-pulse">
-                    🎙 Listening for your command...
-                  </p>
-                )}
               </>
             )}
           </div>
