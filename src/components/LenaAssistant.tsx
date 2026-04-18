@@ -7,7 +7,10 @@ import { motion, AnimatePresence } from 'framer-motion';
 // Constants
 // ─────────────────────────────────────────────
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL = 'llama-3.3-70b-versatile';
+const GROQ_MODEL   = 'llama-3.3-70b-versatile';
+
+// Matches any variant of the wake word (case-insensitive, anywhere in transcript)
+const WAKE_REGEX = /\b(?:hey|hi|ok|okay|hello|oi)\s+lena\b/i;
 
 // ─────────────────────────────────────────────
 // Types
@@ -18,8 +21,8 @@ type LenaStatus = 'idle' | 'listening' | 'wake-detected' | 'processing' | 'speak
 // LenaAssistant Component
 // ─────────────────────────────────────────────
 export const LenaAssistant: React.FC = () => {
-  const navigate    = useNavigate();
-  const location    = useLocation();
+  const navigate = useNavigate();
+  const location = useLocation();
 
   // ── UI state ──
   const [status,       setStatus]       = useState<LenaStatus>('idle');
@@ -27,48 +30,48 @@ export const LenaAssistant: React.FC = () => {
   const [lenaResponse, setLenaResponse] = useState('Click anywhere to activate Lena...');
   const [error,        setError]        = useState<string | null>(null);
 
-  // ── Refs shared across closures ──
-  const recognitionRef       = useRef<any>(null);
-  const voiceRef             = useRef<SpeechSynthesisVoice | null>(null);
-  const utteranceRef         = useRef<SpeechSynthesisUtterance | null>(null);
-  const statusRef            = useRef<LenaStatus>('idle');
-  const isActivatedRef       = useRef(false);
-  const awaitingCommandRef   = useRef(false);
-  const awaitingTimerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pipelineTimersRef    = useRef<ReturnType<typeof setTimeout>[]>([]);
-  const resumeIntervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+  // ── All mutable values shared across closures live in refs ──
+  const recognitionRef     = useRef<any>(null);
+  const voiceRef           = useRef<SpeechSynthesisVoice | null>(null);
+  const utteranceRef       = useRef<SpeechSynthesisUtterance | null>(null);
+  const statusRef          = useRef<LenaStatus>('idle');
+  const isActivatedRef     = useRef(false);
+  const awaitingCommandRef = useRef(false);   // true after "Hey Lena" detected
+  const awaitingTimerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pipelineTimersRef  = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const resumeIntervalRef  = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Latest navigate / pathname accessible from stable closures
-  const navigateRef          = useRef(navigate);
-  const pathnameRef          = useRef(location.pathname);
-  useEffect(() => { navigateRef.current  = navigate;          }, [navigate]);
-  useEffect(() => { pathnameRef.current  = location.pathname; }, [location.pathname]);
+  // Keep navigate + pathname fresh without re-creating recognition
+  const navigateRef  = useRef(navigate);
+  const pathnameRef  = useRef(location.pathname);
+  useEffect(() => { navigateRef.current = navigate;          }, [navigate]);
+  useEffect(() => { pathnameRef.current = location.pathname; }, [location.pathname]);
 
-  // ── Helper: keep status state & ref in sync ──
+  // ── Sync helper ──
   const setStatusBoth = useCallback((s: LenaStatus) => {
     statusRef.current = s;
     setStatus(s);
   }, []);
 
   // ════════════════════════════════════════════
-  // VOICE LOADING  (female-first priority list)
+  // VOICE LOADING
+  // Priority list tuned for Chrome / Edge on Windows & Mac
   // ════════════════════════════════════════════
   useEffect(() => {
     const loadVoice = () => {
       const voices = window.speechSynthesis.getVoices();
       if (!voices.length) return;
 
-      // Priority order – best female voices for Chrome / Edge on Windows & Mac
       const PRIORITY = [
         'Google UK English Female',
         'Microsoft Aria Online (Natural) - English (United States)',
         'Microsoft Aria - English (United States)',
         'Microsoft Zira - English (United States)',
-        'Samantha',   // macOS Safari / Chrome
+        'Samantha',   // macOS
         'Victoria',   // macOS
-        'Karen',      // macOS Australian
-        'Moira',      // macOS Irish
-        'Fiona',      // macOS Scottish
+        'Karen',      // macOS (Australian)
+        'Moira',      // macOS (Irish)
+        'Fiona',      // macOS (Scottish)
         'Google US English',
       ];
 
@@ -77,15 +80,12 @@ export const LenaAssistant: React.FC = () => {
         selected = voices.find(v => v.name.toLowerCase().includes(name.toLowerCase()));
         if (selected) break;
       }
-      // Fallback 1: any English voice with "female" / "woman" in its name
       if (!selected) selected = voices.find(v => v.lang.startsWith('en') && /female|woman/i.test(v.name));
-      // Fallback 2: any en-US / en-GB voice
       if (!selected) selected = voices.find(v => v.lang === 'en-US' || v.lang === 'en-GB');
-      // Fallback 3: any English voice
       if (!selected) selected = voices.find(v => v.lang.startsWith('en'));
 
       voiceRef.current = selected ?? null;
-      console.log('[Lena] Voice selected:', voiceRef.current?.name ?? 'browser default');
+      console.log('[Lena] Voice:', voiceRef.current?.name ?? 'browser default');
     };
 
     window.speechSynthesis.onvoiceschanged = loadVoice;
@@ -95,18 +95,19 @@ export const LenaAssistant: React.FC = () => {
 
   // ════════════════════════════════════════════
   // SPEAK
-  // – Does NOT stop recognition (keeps "stop" always listenable)
-  // – Chrome 15-second TTS bug workaround via setInterval
+  // Recognition keeps running while speaking — the status gate
+  // blocks command processing; Chrome's built-in echo cancellation
+  // (AEC) handles the mic. This avoids any recognition gap.
+  // Chrome 15-second TTS bug is fixed with a resume interval.
   // ════════════════════════════════════════════
   const speak = useCallback((text: string) => {
     if (!window.speechSynthesis || !text.trim()) return;
 
-    // Cancel any in-flight speech
     window.speechSynthesis.cancel();
     if (resumeIntervalRef.current) clearInterval(resumeIntervalRef.current);
 
     const utterance = new SpeechSynthesisUtterance(text);
-    utteranceRef.current = utterance; // prevent GC in Chrome
+    utteranceRef.current = utterance; // keep reference to prevent Chrome GC bug
 
     if (voiceRef.current) utterance.voice = voiceRef.current;
     utterance.pitch  = 1.15;  // slightly higher = more feminine
@@ -116,14 +117,13 @@ export const LenaAssistant: React.FC = () => {
     setStatusBoth('speaking');
     setLenaResponse(text);
 
-    // Chrome silently stops TTS after ~15 s – keep it alive
+    // Chrome silently stops TTS after ~15 s on some versions
     resumeIntervalRef.current = setInterval(() => {
       if (window.speechSynthesis.paused) window.speechSynthesis.resume();
     }, 8_000);
 
     const onDone = () => {
       if (resumeIntervalRef.current) clearInterval(resumeIntervalRef.current);
-      // Return to listening only if we're still the current speech
       if (isActivatedRef.current && statusRef.current === 'speaking') {
         setStatusBoth('listening');
       }
@@ -140,8 +140,8 @@ export const LenaAssistant: React.FC = () => {
 
   // ════════════════════════════════════════════
   // STOP EVERYTHING
-  // – Cancels TTS, pipeline timers, awaiting state
-  // – Stays in listening mode (does NOT speak, avoids "stop" echo loop)
+  // Does NOT speak (avoids "stop" echo loop).
+  // Cancels TTS + all pending timers, returns to listening.
   // ════════════════════════════════════════════
   const stopEverything = useCallback(() => {
     window.speechSynthesis.cancel();
@@ -199,11 +199,11 @@ CRITICAL RULES:
 2. For navigation: type="NAVIGATE", payload=the exact route path.
 3. For clicking a button: type="CLICK", payload=exact button label.
 4. For page summary: type="SUMMARIZE".
-5. For greetings / general questions: type="CHAT".
+5. For greetings/general questions: type="CHAT".
 6. Every action MUST have a spoken verbal confirmation in "response".
 7. Never leave "response" empty or null.
 
-Return strict JSON only — no markdown, no prose:
+Return strict JSON only — no markdown, no extra text:
 {
   "type": "NAVIGATE" | "CLICK" | "SUMMARIZE" | "CHAT",
   "payload": "route path or button label or null",
@@ -213,7 +213,7 @@ Return strict JSON only — no markdown, no prose:
       const res = await fetch(GROQ_API_URL, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${apiKey}`,
+          Authorization:  `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
@@ -232,10 +232,10 @@ Return strict JSON only — no markdown, no prose:
       const data   = await res.json();
       const action = JSON.parse(data.choices[0].message.content);
 
-      // ① Speak the confirmation first (always)
+      // ① Speak the confirmation (always)
       speak(action.response || 'Done.');
 
-      // ② Execute the action after a short pause
+      // ② Execute the action after a brief pause
       setTimeout(() => {
         switch (action.type) {
           case 'NAVIGATE':
@@ -251,8 +251,7 @@ Return strict JSON only — no markdown, no prose:
             if (target) {
               target.click();
             } else {
-              // Delay error speech so it doesn't overlap current speech
-              setTimeout(() => speak(`I couldn't find a button labelled "${action.payload}". Please try again.`), 600);
+              setTimeout(() => speak(`I couldn't find a button labelled "${action.payload}". Could you try again?`), 600);
             }
             break;
           }
@@ -264,7 +263,6 @@ Return strict JSON only — no markdown, no prose:
             break;
           }
 
-          // CHAT — response already spoken
           default:
             break;
         }
@@ -276,24 +274,18 @@ Return strict JSON only — no markdown, no prose:
     }
   }, [speak, setStatusBoth]);
 
-  // ─── Groq summarisation ───────────────────
+  // ─── Groq page summarisation ─────────────────
   const getSummaryFromGroq = async (content: string): Promise<string> => {
     const apiKey = import.meta.env.VITE_GROQ_API_KEY;
     try {
       const res = await fetch(GROQ_API_URL, {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model:    GROQ_MODEL,
           messages: [
-            {
-              role:    'system',
-              content: 'You are Lena, a professional female assistant. Summarise this page content in 2–3 clear sentences suitable for voice delivery. Be concise and informative.',
-            },
-            { role: 'user', content: content },
+            { role: 'system', content: 'You are Lena, a professional female assistant. Summarise this page in 2–3 clear sentences for voice delivery. Be concise.' },
+            { role: 'user',   content },
           ],
         }),
       });
@@ -304,26 +296,37 @@ Return strict JSON only — no markdown, no prose:
     }
   };
 
-  // ─── Keep callback refs fresh for the stable recognition closure ───
-  const processCommandRef  = useRef(processCommand);
-  const stopEverythingRef  = useRef(stopEverything);
-  const speakRef           = useRef(speak);
+  // ─── Keep callback refs fresh for the stable recognition closure ──
+  const processCommandRef = useRef(processCommand);
+  const stopEverythingRef = useRef(stopEverything);
+  const speakRef          = useRef(speak);
   useEffect(() => { processCommandRef.current = processCommand; }, [processCommand]);
   useEffect(() => { stopEverythingRef.current = stopEverything; }, [stopEverything]);
   useEffect(() => { speakRef.current          = speak;          }, [speak]);
 
   // ════════════════════════════════════════════
-  // SPEECH RECOGNITION  (runs exactly ONCE)
+  // SPEECH RECOGNITION  (runs exactly ONCE, empty deps)
   //
-  // Key design decisions:
-  //  • continuous=true — never manually stopped from onresult
-  //    (stopping causes a ~200 ms gap that swallows the real command
-  //     after "Hey Lena" — this was the original bug)
-  //  • "stop" is checked BEFORE any status gate so it always fires
-  //  • isSpeaking is gated via statusRef (recognition keeps running
-  //    for echo-cancel; Chrome's built-in AEC handles the mic)
-  //  • Wake word: set awaitingCommand flag, do NOT stop recognition,
-  //    so the following command utterance is captured immediately
+  // Key design choices:
+  //
+  // 1. continuous=true — recognition never manually stopped from onresult.
+  //    Stopping inside onresult caused a ~200 ms gap that swallowed
+  //    the command spoken right after "Hey Lena".
+  //
+  // 2. Wake-word pre-armed on INTERIM results.
+  //    Chrome fires interim events while the user is still speaking.
+  //    By setting awaitingCommandRef=true on the first interim that
+  //    contains "hey lena", we are ready before the final result arrives.
+  //    When "hey lena" becomes final and there is NO command attached,
+  //    the next final transcript (the actual command) is captured
+  //    immediately with awaitingCommandRef=true still set.
+  //
+  // 3. onend restart delay is 50 ms when awaitingCommand is true
+  //    (vs 200 ms normally) to minimise the gap if Chrome briefly
+  //    ends continuous mode after silence.
+  //
+  // 4. "stop" is checked BEFORE every other gate so it always fires,
+  //    even while Lena is speaking.
   // ════════════════════════════════════════════
   useEffect(() => {
     const SR =
@@ -331,20 +334,20 @@ Return strict JSON only — no markdown, no prose:
       (window as any).webkitSpeechRecognition;
 
     if (!SR) {
-      setError('Speech recognition not supported — please use Chrome or Edge.');
+      setError('Speech recognition not supported. Please use Chrome or Edge.');
       return;
     }
 
     const recognition = new SR() as any;
-    recognition.continuous      = true;   // never auto-stop
-    recognition.interimResults  = true;   // get partial results
+    recognition.continuous      = true;
+    recognition.interimResults  = true;
     recognition.lang            = 'en-US';
     recognition.maxAlternatives = 1;
     recognitionRef.current      = recognition;
 
-    // ── onresult ─────────────────────────────
+    // ─── onresult ────────────────────────────
     recognition.onresult = (event: any) => {
-      let finalT  = '';
+      let finalT   = '';
       let interimT = '';
 
       for (let i = event.resultIndex; i < event.results.length; ++i) {
@@ -353,40 +356,66 @@ Return strict JSON only — no markdown, no prose:
         else                          interimT  += t;
       }
 
-      const combined = (finalT || interimT).toLowerCase().trim();
+      const anyText     = (finalT || interimT).trim();
+      const anyLower    = anyText.toLowerCase();
 
-      // ① STOP — always active, even while Lena is speaking
-      if (combined.includes('stop')) {
+      // ① STOP — always active (even while speaking)
+      if (anyLower.includes('stop')) {
         stopEverythingRef.current();
         return;
       }
 
-      // ② Gate: ignore everything else while speaking or processing
+      // ② Gate: ignore non-stop input while speaking or processing
       if (statusRef.current === 'speaking' || statusRef.current === 'processing') return;
 
-      // ③ Only act on final (confirmed) transcripts from here
+      // ③ PRE-ARM wake word from INTERIM results
+      //    As soon as we see "hey lena" in the partial transcript,
+      //    flag awaitingCommand — so we don't miss the command that follows.
+      if (
+        !awaitingCommandRef.current &&
+        statusRef.current !== 'wake-detected' &&
+        WAKE_REGEX.test(anyLower) &&
+        !finalT.trim()            // only act on interim here
+      ) {
+        awaitingCommandRef.current = true;
+        statusRef.current = 'wake-detected';
+        setStatus('wake-detected');
+        setLenaResponse("Yes? I'm listening...");
+        // (Re-)set the timeout in case the final result takes a moment)
+        if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
+        awaitingTimerRef.current = setTimeout(() => {
+          if (awaitingCommandRef.current) {
+            awaitingCommandRef.current = false;
+            statusRef.current = 'listening';
+            setStatus('listening');
+            speakRef.current("I'm here whenever you're ready. Just say your command.");
+          }
+        }, 7_000);
+      }
+
+      // ④ From here, only act on FINAL transcripts
       if (!finalT.trim()) return;
       const lower = finalT.toLowerCase().trim();
 
-      // ④ Wake-word detection: "hey/hi/ok/hello/oi lena"
-      //    Regex captures any command that follows the wake word in the SAME utterance
-      const wakeMatch = lower.match(
-        /^(?:hey|hi|ok|okay|hello|oi)\s+lena[,.\s]*(.*)/i
-      );
-      if (wakeMatch) {
-        const cmdPart = wakeMatch[1].trim();
-        if (cmdPart.length > 2) {
-          // e.g. "Hey Lena, go to finance" — process inline, no restart needed
-          processCommandRef.current(cmdPart);
+      // ⑤ Wake word in FINAL result — extract any trailing command
+      if (WAKE_REGEX.test(lower)) {
+        // Strip the wake word phrase (and surrounding punctuation/spaces)
+        const commandPart = lower
+          .replace(WAKE_REGEX, '')
+          .replace(/^[,.\s!?]+/, '')
+          .trim();
+
+        if (commandPart.length > 2) {
+          // "Hey Lena, go to finance" — process inline
+          awaitingCommandRef.current = false;
+          if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
+          processCommandRef.current(commandPart);
         } else {
-          // Just "Hey Lena" alone — set flag and show visual cue
-          // Do NOT stop/restart recognition — that caused the gap bug
+          // Just "Hey Lena" — arm already set in step ③ or set here
           awaitingCommandRef.current = true;
           statusRef.current = 'wake-detected';
           setStatus('wake-detected');
           setLenaResponse("Yes? I'm listening...");
-
-          // Timeout: if no command arrives in 5 s, prompt gently
           if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
           awaitingTimerRef.current = setTimeout(() => {
             if (awaitingCommandRef.current) {
@@ -395,32 +424,32 @@ Return strict JSON only — no markdown, no prose:
               setStatus('listening');
               speakRef.current("I'm here whenever you're ready. Just say your command.");
             }
-          }, 5_000);
+          }, 7_000);
         }
         return;
       }
 
-      // ⑤ Awaiting command after wake word (user said "Hey Lena" then paused)
+      // ⑥ Awaiting command (after "Hey Lena" was detected separately)
       if (awaitingCommandRef.current) {
         awaitingCommandRef.current = false;
         if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
+        statusRef.current = 'listening';
+        setStatus('listening');
         processCommandRef.current(finalT.trim());
         return;
       }
 
-      // ⑥ Direct command (no wake word required)
-      //    Noise filter: only process if a recognisable command keyword is present
-      const isCommand = /\b(go to|navigate|open|click|press|show me|take me|what|who|how|help|summarize|summarise|initialize|start|proceed|settings|finance|supply|manufacturing|commercial|assistant|dashboard|hr|logout|log out)\b/i.test(lower);
-      if (isCommand) {
+      // ⑦ Direct command (no wake word needed — filtered by keywords to reduce noise)
+      const isDirectCommand = /\b(go to|navigate|open|click|press|show|take me|what|who|how|help|summarize|summarise|initialize|start|proceed|settings|finance|supply|manufacturing|commercial|assistant|dashboard|hr|logout|log out)\b/i.test(lower);
+      if (isDirectCommand) {
         processCommandRef.current(finalT.trim());
       }
     };
 
-    // ── onerror ───────────────────────────────
+    // ─── onerror ─────────────────────────────
     recognition.onerror = (event: any) => {
       const { error } = event as { error: string };
-      // These are harmless / expected
-      if (error === 'aborted' || error === 'no-speech') return;
+      if (error === 'aborted' || error === 'no-speech') return; // harmless
       if (error === 'not-allowed') {
         setError('Microphone access denied. Please allow microphone and refresh.');
         isActivatedRef.current = false;
@@ -431,29 +460,30 @@ Return strict JSON only — no markdown, no prose:
       console.warn('[Lena] Recognition error:', error);
     };
 
-    // ── onend — indestructible restart ────────
-    // Fires whenever continuous recognition closes (timeout, error, etc.)
+    // ─── onend — indestructible restart ──────
+    // Uses a SHORTER delay when we are waiting for a command after
+    // "Hey Lena", to minimise any gap caused by Chrome briefly
+    // ending continuous recognition on silence.
     recognition.onend = () => {
-      if (isActivatedRef.current) {
-        setTimeout(() => {
-          if (isActivatedRef.current) {
-            try { recognition.start(); } catch (_) {}
-          }
-        }, 200);
-      }
+      if (!isActivatedRef.current) return;
+      const delay = awaitingCommandRef.current ? 50 : 200;
+      setTimeout(() => {
+        if (isActivatedRef.current) {
+          try { recognition.start(); } catch (_) {}
+        }
+      }, delay);
     };
 
-    // ── First-interaction gate (browser autoplay/mic policy) ──
+    // ─── Activation (first user interaction) ─
     const activate = () => {
       if (isActivatedRef.current) return;
       isActivatedRef.current = true;
       statusRef.current = 'listening';
       setStatus('listening');
       setLenaResponse("Hello! I'm Lena. How can I help you today?");
-
       try { recognition.start(); } catch (_) {}
 
-      // Greet after recognition has had time to initialise
+      // Greet after recognition has stabilised
       setTimeout(() => {
         speakRef.current(
           "Hello! I'm Lena, your LENA Platform voice assistant. How can I help you today?"
@@ -477,13 +507,13 @@ Return strict JSON only — no markdown, no prose:
       try { recognition.stop(); } catch (_) {}
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // ← intentionally empty — all callbacks accessed via refs
+  }, []); // ← intentionally empty: all live callbacks accessed via refs
 
   // ════════════════════════════════════════════
   // PIPELINE VOICE NARRATION
   // ════════════════════════════════════════════
   useEffect(() => {
-    const SCRIPT: { delay: number; text: string }[] = [
+    const SCRIPT = [
       { delay:     0, text: 'Initializing LENA Agent Pipeline. All systems are online.' },
       { delay:   800, text: 'Telemetry Agent activated. Tank levels gathered and analysed.' },
       { delay:  6000, text: 'Demand and Allocation Agent engaged. Forecasting supply needs across all regions.' },
@@ -499,9 +529,7 @@ Return strict JSON only — no markdown, no prose:
       pipelineTimersRef.current.forEach(clearTimeout);
       pipelineTimersRef.current = [];
       SCRIPT.forEach(({ delay, text }) => {
-        pipelineTimersRef.current.push(
-          setTimeout(() => speakRef.current(text), delay)
-        );
+        pipelineTimersRef.current.push(setTimeout(() => speakRef.current(text), delay));
       });
     };
 
@@ -514,20 +542,22 @@ Return strict JSON only — no markdown, no prose:
 
   // ════════════════════════════════════════════
   // UI
+  // z-[9999] ensures Lena is always on top regardless of which
+  // layout (SystemLayout / Layout / LandingPage) is active.
   // ════════════════════════════════════════════
   const STATUS_CONFIG: Record<LenaStatus, { dot: string; label: string }> = {
-    'idle':          { dot: 'bg-gray-400',                  label: 'Inactive' },
-    'listening':     { dot: 'bg-green-500 animate-pulse',   label: 'Listening...' },
+    'idle':          { dot: 'bg-gray-400',                  label: 'Inactive'           },
+    'listening':     { dot: 'bg-green-500 animate-pulse',   label: 'Listening...'       },
     'wake-detected': { dot: 'bg-yellow-400 animate-bounce', label: 'Awaiting command...' },
-    'processing':    { dot: 'bg-blue-400',                  label: 'Processing...' },
-    'speaking':      { dot: 'bg-primary animate-pulse',     label: 'Speaking...' },
+    'processing':    { dot: 'bg-blue-400',                  label: 'Processing...'      },
+    'speaking':      { dot: 'bg-primary animate-pulse',     label: 'Speaking...'        },
   };
 
-  const isActive = status === 'processing' || status === 'speaking';
+  const canStop = status === 'processing' || status === 'speaking';
 
   if (error) {
     return (
-      <div className="fixed bottom-4 right-4 bg-destructive/90 text-destructive-foreground p-3 rounded-lg shadow-xl z-50 text-sm flex items-center gap-2">
+      <div className="fixed bottom-4 right-4 z-[9999] bg-destructive/90 text-destructive-foreground p-3 rounded-lg shadow-xl text-sm flex items-center gap-2">
         <MicOff className="w-4 h-4 flex-shrink-0" />
         <span>{error}</span>
         <button onClick={() => setError(null)} className="ml-1 hover:opacity-70">
@@ -543,7 +573,8 @@ Return strict JSON only — no markdown, no prose:
         initial={{ opacity: 0, scale: 0.9, y: 20 }}
         animate={{ opacity: 1, scale: 1,   y: 0  }}
         exit={{    opacity: 0, scale: 0.9, y: 20 }}
-        className="fixed bottom-6 right-6 z-[100] w-80"
+        // z-[9999] overrides all layouts including SystemLayout's SidebarProvider
+        className="fixed bottom-6 right-6 z-[9999] w-80"
       >
         <div className="bg-background/80 backdrop-blur-xl border border-primary/20 rounded-2xl shadow-2xl overflow-hidden">
 
@@ -555,7 +586,7 @@ Return strict JSON only — no markdown, no prose:
             </div>
             <div className="flex items-center gap-2">
               <span className="text-xs text-muted-foreground">{STATUS_CONFIG[status].label}</span>
-              {isActive && (
+              {canStop && (
                 <button
                   onClick={stopEverything}
                   title="Stop Lena"
@@ -597,21 +628,30 @@ Return strict JSON only — no markdown, no prose:
                     <span className="text-sm">{lenaResponse}</span>
                   )}
                 </div>
+
+                {/* Wake-word tip — only shown briefly when status is listening */}
+                {status === 'listening' && (
+                  <p className="text-[10px] text-muted-foreground/40 text-center">
+                    Say <span className="font-semibold text-primary/40">"Hey Lena"</span> or speak a command directly
+                  </p>
+                )}
               </>
             )}
           </div>
 
-          {/* ── Animated bar ── */}
+          {/* ── Animated activity bar ── */}
           <div className="h-1 bg-primary/5 relative overflow-hidden">
             <motion.div
               className="absolute inset-0 bg-primary/50"
               style={{ originX: 0 }}
               animate={{
-                scaleX:  status === 'idle'      ? 0
-                        : status === 'listening' ? 0.25
+                scaleX:  status === 'idle'           ? 0
+                        : status === 'listening'      ? 0.25
+                        : status === 'wake-detected'  ? 0.6
                         : [0.2, 1, 0.5, 1],
-                opacity: status === 'idle'      ? 0
-                        : status === 'listening' ? 0.4
+                opacity: status === 'idle'            ? 0
+                        : status === 'listening'       ? 0.35
+                        : status === 'wake-detected'   ? 0.7
                         : [0.4, 1, 0.5],
               }}
               transition={{ repeat: Infinity, duration: 1.5, ease: 'easeInOut' }}
