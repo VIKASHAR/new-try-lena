@@ -181,7 +181,7 @@ export default function LandingPage() {
 
         {/* Full name */}
         <p className="mb-8 mt-1.5 font-mono text-[11px] uppercase tracking-[0.28em] text-muted-foreground/60">
-          Linde&rsquo;s Enterprise Neural Agent
+          Linde&rsquo;s Enterprise Nexus AI
         </p>
 
         {/* Animated taglines */}
